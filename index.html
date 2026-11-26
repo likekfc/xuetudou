@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#2a1a10" />
+  <link rel="icon" href="data:," />
+  <meta name="description" content="土豆削削乐 —— 拇指削皮，越削越上头。基于 Potato Please 玩法的微信小游戏。" />
+  <title>土豆削削乐 · 微信小游戏</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1d130c;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-user-select: none;
+      user-select: none;
+      overscroll-behavior: none;
+    }
+    #game {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      touch-action: none;
+      outline: none;
+    }
+    #boot {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #f7e3ae;
+      font: 600 15px/1.6 "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #1d130c;
+      letter-spacing: 1px;
+      z-index: 9;
+      transition: opacity .35s ease;
+      pointer-events: none;
+    }
+    #boot.hide { opacity: 0; }
+    @media (min-width: 720px) {
+      body { background: radial-gradient(circle at 50% 30%, #3a2718, #150d08 70%); }
+      #game {
+        width: min(430px, 100vw);
+        height: min(932px, 100vh);
+        margin: auto;
+        box-shadow: 0 24px 80px rgba(0,0,0,.55);
+      }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="boot">正在把土豆倒进桶里…</div>
+  <script>
+    window.addEventListener('load', function () {
+      var b = document.getElementById('boot');
+      if (b) { b.className = 'hide'; setTimeout(function () { b.parentNode && b.parentNode.removeChild(b); }, 400); }
+    });
+  </script>
+  <script src="./minigame/game.js"></script>
+</body>
+</html>

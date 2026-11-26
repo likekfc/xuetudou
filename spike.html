@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>3D Spike · WebGL + 离屏2D UI 合成 + 射线 UV</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#150d08;}
+  #gl{display:block;width:100vw;height:100vh;touch-action:none;}
+  #hint{position:fixed;left:10px;bottom:8px;color:#f7e3ae;font:12px/1.5 sans-serif;opacity:.7;pointer-events:none;z-index:5;}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hint">移动鼠标到立方体上 → 右下角应显示命中 UV</div>
+<script src="https://unpkg.com/three@0.133.1/build/three.min.js"></script>
+<script>
+(function(){
+  var glCanvas = document.getElementById('gl');
+  var W = window.innerWidth, H = window.innerHeight;
+  glCanvas.width = W; glCanvas.height = H;
+
+  // ---- 主场景：旋转立方体（带网格纹理，便于看 UV）----
+  var renderer = new THREE.WebGLRenderer({canvas: glCanvas, antialias: true});
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(W, H, false);
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x2a1a10);
+  var camera = new THREE.PerspectiveCamera(50, W/H, 0.1, 100);
+  camera.position.set(0, 0, 4);
+
+  // 生成一张带网格 + 数字标记的纹理，方便确认 UV 与旋转
+  var texCanvas = document.createElement('canvas');
+  texCanvas.width = texCanvas.height = 256;
+  var tctx = texCanvas.getContext('2d');
+  tctx.fillStyle = '#c89b6b'; tctx.fillRect(0,0,256,256);
+  tctx.strokeStyle = '#5a3a1c'; tctx.lineWidth = 2;
+  for (var i=0;i<=256;i+=32){ tctx.beginPath(); tctx.moveTo(i,0); tctx.lineTo(i,256); tctx.stroke(); tctx.beginPath(); tctx.moveTo(0,i); tctx.lineTo(256,i); tctx.stroke(); }
+  tctx.fillStyle = '#fff'; tctx.font = 'bold 40px sans-serif'; tctx.textAlign='center';
+  tctx.fillText('UV', 128, 145);
+  var cubeTex = new THREE.CanvasTexture(texCanvas);
+
+  var cube = new THREE.Mesh(
+    new THREE.BoxGeometry(2,2,2),
+    new THREE.MeshLambertMaterial({map: cubeTex})
+  );
+  scene.add(cube);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+  var dir = new THREE.DirectionalLight(0xffffff, 0.8); dir.position.set(3,4,5); scene.add(dir);
+
+  // ---- 离屏 2D 画布：UI 层（之后要作为全屏纹理叠加）----
+  var uiCanvas = document.createElement('canvas');
+  uiCanvas.width = W; uiCanvas.height = H;
+  var uictx = uiCanvas.getContext('2d');
+  var uiTexture = new THREE.CanvasTexture(uiCanvas);
+
+  var uiScene = new THREE.Scene();
+  var uiCam = new THREE.OrthographicCamera(-W/2, W/2, H/2, -H/2, 0, 10);
+  var uiQuad = new THREE.Mesh(
+    new THREE.PlaneGeometry(W, H),
+    new THREE.MeshBasicMaterial({map: uiTexture, transparent: true, depthTest: false, depthWrite: false})
+  );
+  uiQuad.renderOrder = 999;
+  uiScene.add(uiQuad);
+
+  // ---- 射线检测 ----
+  var raycaster = new THREE.Raycaster();
+  var pointer = new THREE.Vector2();
+  var lastUV = null;
+  function onPointerMove(e){
+    var rect = glCanvas.getBoundingClientRect();
+    var x = (e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - rect.left;
+    var y = (e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - rect.top;
+    pointer.x = (x / rect.width) * 2 - 1;
+    pointer.y = -(y / rect.height) * 2 + 1;
+    raycaster.setFromCamera(pointer, camera);
+    var hits = raycaster.intersectObject(cube, false);
+    if (hits.length){
+      var uv = hits[0].uv;
+      lastUV = {x: uv.x, y: uv.y, px: x, py: y};
+    } else {
+      lastUV = null;
+    }
+  }
+  glCanvas.addEventListener('mousemove', onPointerMove);
+  glCanvas.addEventListener('touchmove', onPointerMove, {passive:true});
+
+  // ---- 主循环 ----
+  var t0 = performance.now();
+  function drawUI(){
+    uictx.clearRect(0,0,W,H);
+    // 顶部半透明面板
+    uictx.fillStyle = 'rgba(20,12,6,0.55)';
+    uictx.fillRect(0,0,W,64);
+    uictx.fillStyle = '#f7e3ae';
+    uictx.font = 'bold 22px "PingFang SC", "Microsoft YaHei", sans-serif';
+    uictx.textAlign = 'left';
+    uictx.fillText('SPIKE: WebGL 立方体 + 离屏2D UI 合成', 16, 40);
+    // 命中信息
+    if (lastUV){
+      uictx.fillStyle = 'rgba(40,80,40,0.7)';
+      uictx.fillRect(W-230, H-70, 220, 60);
+      uictx.fillStyle = '#aef7b0';
+      uictx.font = '14px monospace';
+      uictx.textAlign = 'left';
+      uictx.fillText('HIT UV = (' + lastUV.x.toFixed(3) + ', ' + lastUV.y.toFixed(3) + ')', W-220, H-45);
+      uictx.fillText('pointer = (' + lastUV.px.toFixed(0) + ', ' + lastUV.py.toFixed(0) + ')', W-220, H-25);
+    }
+    uiTexture.needsUpdate = true;
+  }
+  function loop(){
+    var t = (performance.now() - t0) / 1000;
+    cube.rotation.x = t * 0.5;
+    cube.rotation.y = t * 0.7;
+
+    drawUI();
+
+    renderer.autoClear = true;
+    renderer.render(scene, camera);
+    renderer.autoClear = false;
+    renderer.clearDepth();
+    renderer.render(uiScene, uiCam);
+    requestAnimationFrame(loop);
+  }
+  loop();
+})();
+</script>
+</body>
+</html>

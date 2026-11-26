@@ -1,0 +1,24 @@
+{
+  "name": "potato-please-minigame",
+  "version": "1.0.0",
+  "private": true,
+  "description": "土豆削削乐 —— 微信小游戏（Potato Please 移动端改编）",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "serve": "node scripts/serve.js",
+    "dev": "node scripts/build.js && node scripts/serve.js"
+  },
+  "keywords": [
+    "wechat",
+    "minigame",
+    "canvas",
+    "potato"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "three-platformize": "1.133.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
