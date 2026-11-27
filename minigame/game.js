@@ -1,4 +1,4 @@
-/*! 土豆削削乐 · WeChat MiniGame bundle · built 2026-11-26T12:52:55.840Z */
+/*! 土豆削削乐 · WeChat MiniGame bundle · built 2026-11-27T01:50:16.760Z */
 (function(){
 "use strict";
 var __defs = {};
@@ -40,6 +40,7 @@ var Sound = require('./audio');
 var Ads = require('./ads');
 var UI = require('./ui');
 var T = UI.T;
+var render3d = require('./render3d');
 var MenuScene = require('./scenes/menu');
 var PlayScene = require('./scenes/play');
 
@@ -66,11 +67,25 @@ var Main = {
     Economy.init();
     Sound.setMuted(!Economy.s.settings.sound);
 
+    // 3D 管线优先初始化（创建 WebGL 上屏画布 + 离屏 2D UI 画布）
+    var _3dOk = false;
+    try {
+      render3d.init();
+      _3dOk = true;
+    } catch (e) {
+      console.error('[Main] render3d init failed, fall back to 2D:', e.message);
+    }
+    this._3dOk = _3dOk;
+
+    // 把离屏 uiCanvas 喂给 Platform，游戏 UI 全部画在离屏 canvas 上，
+    // 再由 render3d 每帧作为全屏纹理叠加在 3D 层上
+    var uiCanvas = _3dOk ? render3d.getUICanvas() : null;
+    var touchCanvas = _3dOk ? render3d.getGlCanvas() : null;
     Platform.init({
       start: function (p) { self.onDown(p); },
       move: function (p) { self.onMove(p); },
       end: function (p) { self.onUp(p); }
-    });
+    }, uiCanvas ? { canvas: uiCanvas, touchCanvas: touchCanvas || uiCanvas } : undefined);
     this.ctx = Platform.ctx;
     this.W = Platform.W;
     this.H = Platform.H;
@@ -132,8 +147,12 @@ var Main = {
     if (!this.lastTs) this.lastTs = now;
     var dt = Math.min(0.05, Math.max(0, (now - this.lastTs) / 1000));
     this.lastTs = now;
+    this._t = (this._t || 0) + dt;
     this.update(dt);
     this.render();
+    if (this._3dOk) {
+      try { render3d.render(this._t, dt); } catch (e) { console.error('[render3d.frame]', e.message); }
+    }
     Platform.raf(function (t) { self.frame(t); });
   },
 
@@ -145,6 +164,7 @@ var Main = {
       if (this.fade >= 1) {
         this.fade = 1;
         if (this.pendingScene) {
+          if (this.scene && this.scene.onHide) this.scene.onHide();
           this.scene = this.pendingScene;
           this.pendingScene = null;
           if (this.scene.enter) this.scene.enter();
@@ -720,10 +740,10 @@ var CONFIG = {
   },
 
   // 3D 渲染（Three.js）配置。
-  // Task 1 验证期：spike 在微信环境默认开启（开发者工具编译即可看到验证画面）；
-  // 浏览器需在 URL 加 ?spike=1 才进入 spike，否则跑正常游戏。验证通过后 spike 关闭。
+  // Task 1 技术验证已完成，spike 默认关闭。
+  // 如需重新跑 3D 验证，把 spike 改为 true。
   render3d: {
-    spike: (typeof wx !== 'undefined') ? true : (typeof window !== 'undefined' && /[?&]spike=1/.test(window.location.search))
+    spike: false
   }
 };
 
@@ -747,7 +767,9 @@ var Platform = {
   safeBottom: 0,
   _touches: null,
 
-  init: function (touchHandlers) {
+  // opts: { canvas: 外部传入的 canvas（3D 模式下是离屏 uiCanvas）, touchCanvas: 浏览器模式下接收 pointer 事件的可见 canvas }
+  init: function (touchHandlers, opts) {
+    opts = opts || {};
     var info = this._windowInfo();
     this.dpr = Math.min(info.pixelRatio || 1, 2.5);
     this.W = info.windowWidth;
@@ -755,8 +777,13 @@ var Platform = {
     this.safeTop = info.safeTop || 0;
     this.safeBottom = info.safeBottom || 0;
 
-    if (isWx) {
+    if (opts.canvas) {
+      // 3D 模式：外部传入离屏 canvas 当 UI 绘制目标
+      this.canvas = opts.canvas;
+      this.touchCanvas = opts.touchCanvas || opts.canvas;
+    } else if (isWx) {
       this.canvas = wx.createCanvas();
+      this.touchCanvas = this.canvas;
     } else {
       this.canvas = document.getElementById('game');
       if (!this.canvas) {
@@ -764,12 +791,16 @@ var Platform = {
         this.canvas.id = 'game';
         document.body.appendChild(this.canvas);
       }
+      this.touchCanvas = this.canvas;
       this.W = Math.round(this.canvas.getBoundingClientRect().width) || info.windowWidth;
       this.H = Math.round(this.canvas.getBoundingClientRect().height) || info.windowHeight;
     }
 
-    this.canvas.width = Math.floor(this.W * this.dpr);
-    this.canvas.height = Math.floor(this.H * this.dpr);
+    // 外部传入 canvas（3D 模式）：尊重 render3d 已经设好的物理尺寸
+    if (!opts.canvas) {
+      this.canvas.width = Math.floor(this.W * this.dpr);
+      this.canvas.height = Math.floor(this.H * this.dpr);
+    }
     this.ctx = this.canvas.getContext('2d');
 
     this._bindTouch(touchHandlers || {});
@@ -814,10 +845,13 @@ var Platform = {
     if (isWx) {
       this.W = info.windowWidth;
       this.H = info.windowHeight;
-    } else {
-      var r = this.canvas.getBoundingClientRect();
+    } else if (this.touchCanvas && this.touchCanvas.getBoundingClientRect) {
+      var r = this.touchCanvas.getBoundingClientRect();
       this.W = Math.round(r.width) || info.windowWidth;
       this.H = Math.round(r.height) || info.windowHeight;
+    } else {
+      this.W = info.windowWidth;
+      this.H = info.windowHeight;
     }
     this.safeTop = info.safeTop;
     this.safeBottom = info.safeBottom;
@@ -867,21 +901,21 @@ var Platform = {
     } else {
       var dragging = false;
       var toLocal = function (ev) {
-        var r = self.canvas.getBoundingClientRect();
+        var r = self.touchCanvas.getBoundingClientRect();
         return {
           x: (ev.clientX - r.left) * (self.W / r.width),
           y: (ev.clientY - r.top) * (self.H / r.height)
         };
       };
-      this.canvas.addEventListener('pointerdown', function (ev) {
+      this.touchCanvas.addEventListener('pointerdown', function (ev) {
         ev.preventDefault();
         dragging = true;
-        if (self.canvas.setPointerCapture) {
-          try { self.canvas.setPointerCapture(ev.pointerId); } catch (e) {}
+        if (self.touchCanvas.setPointerCapture) {
+          try { self.touchCanvas.setPointerCapture(ev.pointerId); } catch (e) {}
         }
         if (h.start) h.start(toLocal(ev));
       });
-      this.canvas.addEventListener('pointermove', function (ev) {
+      this.touchCanvas.addEventListener('pointermove', function (ev) {
         if (!dragging) return;
         ev.preventDefault();
         if (h.move) h.move(toLocal(ev));
@@ -891,9 +925,9 @@ var Platform = {
         dragging = false;
         if (h.end) h.end(toLocal(ev));
       };
-      this.canvas.addEventListener('pointerup', up);
-      this.canvas.addEventListener('pointercancel', up);
-      this.canvas.addEventListener('contextmenu', function (ev) { ev.preventDefault(); });
+      this.touchCanvas.addEventListener('pointerup', up);
+      this.touchCanvas.addEventListener('pointercancel', up);
+      this.touchCanvas.addEventListener('contextmenu', function (ev) { ev.preventDefault(); });
     }
   },
 
@@ -2415,2988 +2449,76 @@ module.exports = {
 };
 
 };
-__defs["scenes/menu"] = function(module, exports, require){
+__defs["render3d"] = function(module, exports, require){
 /**
- * 大厅：订单入口、军需商店、每日补给、任务、自动削皮机、广告位。
+ * render3d v2 — 3D 渲染管线 + OrbitControls + 削皮射线
+ *
+ * 核心架构：
+ *   glCanvas  (上屏, dpr×dpr 物理像素) ← WebGL Three.js
+ *   uiCanvas  (离屏, dpr×dpr 物理像素) ← 2D Canvas → 全屏纹理 Quad 叠加
+ *
+ * 土豆固定在世界原点 (0,0,0)，相机用 OrbitControls 绕转。
+ * 交互手势：
+ *   - 单指拖拽（PlayScene 中）→ 削皮
+ *   - 两指手势（任意场景）→ 旋转 / 缩放视角
  */
-var CONFIG = require('../config');
-var Platform = require('../platform');
-var Economy = require('../economy');
-var Ads = require('../ads');
-var Sound = require('../audio');
-var UI = require('../ui');
-var T = UI.T;
-var ShopOverlay = require('./shop');
-var DailyOverlay = require('./daily');
-var SettingsOverlay = require('./settings');
 
-function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-
-var TIPS = [
-  '削薄一点，别浪费。',
-  '军需官说：今天也要削满一桶。',
-  '刀越快，皮越薄。',
-  '反复刮同一处，果肉会哭。',
-  '机器会记得你削过的每一颗土豆。'
-];
-
-function MenuScene(main) {
-  this.main = main;
-  this.t = 0;
-  this.overlay = null;
-  this.active = null;
-  this.tip = TIPS[0];
-  this.tipT = 0;
-  this.coinShown = 0;
-  this.layout();
-}
-
-MenuScene.prototype.layout = function () {
-  var main = this.main;
-  var W = main.W;
-  var H = main.H;
-  var st = Platform.safeTop;
-  var sb = Platform.safeBottom;
-  this.W = W;
-  this.H = H;
-  this.safeTop = st;
-  this.safeBottom = sb;
-
-  this.titleY = st + clamp(H * 0.105, 60, 92);
-  this.titleSize = clamp(W * 0.108, 30, 44);
-  this.titleY = st + clamp(H * 0.105, 60, 92);
-  var titleMin = st + 60 + this.titleSize * 0.55;
-  if (this.titleY < titleMin) this.titleY = titleMin;
-  this.mascotY = this.titleY + clamp(H * 0.125, 76, 132);
-  this.mascotR = clamp(W * 0.125, 36, 52);
-
-  this.cardX = 18;
-  this.cardW = W - 36;
-  this.cardH = H < 700 ? 150 : (H > 800 ? 176 : 160);
-  this.cardY = this.mascotY + clamp(H * 0.10, 72, 112);
-  this.rowY = this.cardY + this.cardH + 12;
-  this.rowH = 60;
-  this.tileGap = 9;
-  this.tileW = (this.cardW - this.tileGap * 2) / 3;
-
-  this.bannerY = H - sb - 56;
-  this.idleH = 54;
-  this.idleY = this.bannerY - this.idleH - 10;
-  this.pileTop = this.rowY + this.rowH + 10;
-  this.pileBottom = this.idleY - 8;
-
-  this.refresh();
-};
-
-MenuScene.prototype.enter = function () {
-  Economy.refresh();
-  Economy.updateIdle();
-  Ads.showBanner();
-  this.coinShown = Economy.s.coins;
-  this.refresh();
-};
-
-MenuScene.prototype.onHide = function () {
-  Economy.save();
-};
-
-MenuScene.prototype.refresh = function () {
-  var main = this.main;
-  var W = this.W;
-  var st = this.safeTop;
-  var order = Economy.nextOrder();
-  var daily = Economy.dailyInfo();
-  var quests = Economy.questList();
-  var claimable = 0;
-  for (var i = 0; i < quests.length; i++) if (quests[i].canClaim) claimable++;
-  this.order = order;
-  this.daily = daily;
-  this.questClaimable = claimable;
-  this.idle = Economy.idleInfo();
-
-  var areas = [];
-  function add(o) { areas.push(o); return o; }
-
-  add({ x: 16, y: st + 10, w: 42, h: 42, action: 'sound' });
-  add({ x: 64, y: st + 10, w: 42, h: 42, action: 'settings' });
-  add({ x: W - 16 - 118 - 46, y: st + 10, w: 42, h: 42, action: 'share' });
-  add({ x: W - 16 - 118, y: st + 12, w: 118, h: 38, action: 'coins' });
-  add({ x: this.cardX + 14, y: this.cardY + this.cardH - 56, w: this.cardW - 28, h: 46, action: 'play', pressed: false });
-
-  for (var k = 0; k < 3; k++) {
-    add({
-      x: this.cardX + k * (this.tileW + this.tileGap),
-      y: this.rowY,
-      w: this.tileW,
-      h: this.rowH,
-      action: k === 0 ? 'shop' : k === 1 ? 'daily' : 'tasks',
-      pressed: false
-    });
-  }
-
-  if (this.idle.rate > 0 && this.idle.pending >= 1) {
-    add({ x: W - 18 - 122, y: this.idleY + 10, w: 56, h: 34, action: 'idleCollect', pressed: false });
-    add({ x: W - 18 - 62, y: this.idleY + 10, w: 62, h: 34, action: 'idleDouble', pressed: false });
-  } else {
-    add({ x: W - 18 - 86, y: this.idleY + 10, w: 86, h: 34, action: 'idleGo', pressed: false });
-  }
-
-  this.areas = areas;
-};
-
-MenuScene.prototype.update = function (dt) {
-  this.t += dt;
-  this.tipT += dt;
-  if (this.tipT > 4.5) {
-    this.tipT = 0;
-    this.tip = TIPS[Math.floor(Math.random() * TIPS.length)];
-  }
-  var target = Economy.s.coins;
-  this.coinShown += (target - this.coinShown) * Math.min(1, dt * 10);
-  if (Math.abs(target - this.coinShown) < 0.6) this.coinShown = target;
-  if (this.overlay && this.overlay.update) this.overlay.update(dt);
-};
-
-MenuScene.prototype.render = function (ctx) {
-  var W = this.W;
-  var H = this.H;
-  var t = this.t;
-
-  this.drawBackground(ctx, t);
-  this.drawTopBar(ctx);
-  this.drawTitle(ctx);
-  this.drawMascot(ctx, t);
-  this.drawOrderCard(ctx, t);
-  this.drawTiles(ctx);
-  this.drawPile(ctx, t);
-  this.drawIdleBar(ctx);
-  this.drawBanner(ctx);
-
-  if (this.overlay) this.overlay.render(ctx);
-};
-
-MenuScene.prototype.drawBackground = function (ctx, t) {
-  var W = this.W;
-  var H = this.H;
-  var wallH = H * 0.63;
-
-  var bg = ctx.createLinearGradient(0, 0, 0, H);
-  bg.addColorStop(0, '#FBEDD0');
-  bg.addColorStop(0.62, '#F2DFBA');
-  bg.addColorStop(1, '#DDBE8B');
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, W, H);
-
-  // 瓷砖墙
-  ctx.save();
-  ctx.globalAlpha = 0.5;
-  ctx.strokeStyle = '#E2C99F';
-  ctx.lineWidth = 1;
-  var tile = Math.max(38, W / 9);
-  for (var x = 0; x < W; x += tile) {
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, wallH);
-    ctx.stroke();
-  }
-  for (var y = 0; y < wallH; y += tile) {
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(W, y);
-    ctx.stroke();
-  }
-  ctx.restore();
-
-  // 灯光
-  var lg = ctx.createRadialGradient(W * 0.5, H * 0.2, 10, W * 0.5, H * 0.2, W * 0.75);
-  lg.addColorStop(0, 'rgba(255,248,220,0.55)');
-  lg.addColorStop(1, 'rgba(255,248,220,0)');
-  ctx.fillStyle = lg;
-  ctx.fillRect(0, 0, W, H);
-
-  // 台面
-  var cg = ctx.createLinearGradient(0, wallH, 0, H);
-  cg.addColorStop(0, '#C99159');
-  cg.addColorStop(0.12, '#B57C46');
-  cg.addColorStop(1, '#8E5B2D');
-  ctx.fillStyle = cg;
-  ctx.fillRect(0, wallH, W, H - wallH);
-  ctx.fillStyle = 'rgba(255,236,200,0.28)';
-  ctx.fillRect(0, wallH, W, 2);
-
-  // 木纹
-  ctx.save();
-  ctx.globalAlpha = 0.13;
-  ctx.strokeStyle = '#5E3A18';
-  ctx.lineWidth = 1.4;
-  for (var i = 0; i < 7; i++) {
-    var yy = wallH + 26 + i * 36;
-    ctx.beginPath();
-    ctx.moveTo(0, yy);
-    ctx.bezierCurveTo(W * 0.3, yy - 4, W * 0.6, yy + 6, W, yy - 2);
-    ctx.stroke();
-  }
-  ctx.restore();
-};
-
-MenuScene.prototype.drawTopBar = function (ctx) {
-  var W = this.W;
-  var st = this.safeTop;
-  var sound = Economy.s.settings.sound;
-  UI.button(ctx, UI.makeButton({
-    x: 16, y: st + 10, w: 42, h: 42, kind: 'icon', radius: 13,
-    icon: sound ? 'sound' : 'soundOff', iconSize: 22, active: false
-  }));
-  UI.button(ctx, UI.makeButton({
-    x: 64, y: st + 10, w: 42, h: 42, kind: 'icon', radius: 13, icon: 'gear', iconSize: 22
-  }));
-  UI.button(ctx, UI.makeButton({
-    x: W - 16 - 118 - 46, y: st + 10, w: 42, h: 42, kind: 'icon', radius: 13, icon: 'share', iconSize: 19
-  }));
-
-  var pillW = 118;
-  var pillX = W - 16 - pillW;
-  UI.pill(ctx, pillX, st + 12, pillW, 38, 'rgba(255,248,232,0.95)', 'rgba(150,103,52,0.32)');
-  UI.drawCoin(ctx, pillX + 20, st + 31, 11);
-  UI.text(ctx, String(Math.round(this.coinShown)), pillX + pillW - 12, st + 31, 16, T.ink, 'right', 800);
-};
-
-MenuScene.prototype.drawTitle = function (ctx) {
-  var W = this.W;
-  var y = this.titleY;
-  var size = this.titleSize;
-  ctx.save();
-  ctx.translate(W / 2, y);
-  ctx.rotate(-0.018);
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.font = UI.font(size, 900);
-  ctx.lineWidth = 8;
-  ctx.strokeStyle = 'rgba(255,248,230,0.9)';
-  ctx.strokeText('土豆削削乐', 0, 0);
-  var g = ctx.createLinearGradient(0, -size * 0.6, 0, size * 0.6);
-  g.addColorStop(0, '#7A4A22');
-  g.addColorStop(1, '#4A2E19');
-  ctx.fillStyle = g;
-  ctx.fillText('土豆削削乐', 0, 0);
-  ctx.restore();
-
-  if (this.mascotY - this.titleY > 112) {
-    UI.text(ctx, this.tip, W / 2, y + size * 0.68 + 6, 11, 'rgba(126,90,56,0.95)', 'center', 600);
-  }
-};
-
-MenuScene.prototype.drawMascot = function (ctx, t) {
-  var W = this.W;
-  var cx = W / 2;
-  var cy = this.mascotY - 6 + Math.sin(t * 2.1) * 4;
-  var r = this.mascotR;
-
-  // 影子
-  ctx.save();
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(cx, cy + r * 1.05, r * 0.78, r * 0.16, 0, 0, Math.PI * 2) : ctx.arc(cx, cy + r, r * 0.3, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(70,40,15,0.16)';
-  ctx.fill();
-  ctx.restore();
-
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(Math.sin(t * 1.4) * 0.03);
-
-  // 土豆身体
-  ctx.beginPath();
-  ctx.moveTo(-r * 0.98, 0);
-  ctx.bezierCurveTo(-r * 0.98, -r * 0.82, -r * 0.5, -r * 1.02, r * 0.04, -r * 0.98);
-  ctx.bezierCurveTo(r * 0.68, -r * 0.94, r * 1.02, -r * 0.5, r * 0.98, r * 0.08);
-  ctx.bezierCurveTo(r * 0.94, r * 0.66, r * 0.48, r * 1.02, -r * 0.08, r * 0.98);
-  ctx.bezierCurveTo(-r * 0.64, r * 0.94, -r * 0.98, r * 0.58, -r * 0.98, 0);
-  ctx.closePath();
-  var bg = ctx.createRadialGradient(-r * 0.3, -r * 0.4, r * 0.1, 0, 0, r * 1.3);
-  bg.addColorStop(0, '#D6A06C');
-  bg.addColorStop(0.6, '#B87A42');
-  bg.addColorStop(1, '#8A5326');
-  ctx.fillStyle = bg;
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(80,45,18,0.35)';
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
-
-  // 削开的果肉（左下角小片，避免像大嘴）
-  ctx.save();
-  ctx.beginPath();
-  ctx.moveTo(-r * 0.9, r * 0.3);
-  ctx.quadraticCurveTo(-r * 0.66, r * 0.82, -r * 0.16, r * 0.74);
-  ctx.quadraticCurveTo(-r * 0.42, r * 0.52, -r * 0.9, r * 0.3);
-  ctx.closePath();
-  var fg = ctx.createLinearGradient(0, r * 0.2, 0, r * 0.9);
-  fg.addColorStop(0, '#FFF2CC');
-  fg.addColorStop(1, '#EDCF90');
-  ctx.fillStyle = fg;
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(150,104,45,0.35)';
-  ctx.lineWidth = 1;
-  ctx.stroke();
-  ctx.restore();
-
-  // 眼睛
-  ctx.beginPath();
-  ctx.arc(-r * 0.3, -r * 0.18, r * 0.075, 0, Math.PI * 2);
-  ctx.arc(r * 0.26, -r * 0.2, r * 0.075, 0, Math.PI * 2);
-  ctx.fillStyle = '#3F2715';
-  ctx.fill();
-  ctx.beginPath();
-  ctx.arc(-r * 0.28, -r * 0.21, r * 0.026, 0, Math.PI * 2);
-  ctx.arc(r * 0.28, -r * 0.23, r * 0.026, 0, Math.PI * 2);
-  ctx.fillStyle = '#FFF9E8';
-  ctx.fill();
-
-  // 微笑
-  ctx.beginPath();
-  ctx.arc(0, -r * 0.02, r * 0.16, 0.25, Math.PI - 0.25);
-  ctx.strokeStyle = '#4A2E19';
-  ctx.lineWidth = 2.2;
-  ctx.lineCap = 'round';
-  ctx.stroke();
-
-  // 腮红
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(-r * 0.52, r * 0.02, r * 0.1, r * 0.06, 0, 0, Math.PI * 2) :
-    ctx.arc(-r * 0.52, r * 0.02, r * 0.07, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(214,105,79,0.35)';
-  ctx.fill();
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(r * 0.46, r * 0.0, r * 0.1, r * 0.06, 0, 0, Math.PI * 2) :
-    ctx.arc(r * 0.46, 0, r * 0.07, 0, Math.PI * 2);
-  ctx.fill();
-
-  // 小芽
-  ctx.beginPath();
-  ctx.moveTo(r * 0.02, -r * 0.97);
-  ctx.quadraticCurveTo(r * 0.06, -r * 1.14, r * 0.2, -r * 1.18);
-  ctx.strokeStyle = '#5E8B45';
-  ctx.lineWidth = 2.2;
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(r * 0.25, -r * 1.19, r * 0.1, r * 0.055, -0.5, 0, Math.PI * 2) :
-    ctx.arc(r * 0.23, -r * 1.18, r * 0.075, 0, Math.PI * 2);
-  ctx.fillStyle = '#7FB069';
-  ctx.fill();
-
-  // 小刀
-  ctx.save();
-  ctx.translate(r * 1.12, r * 0.12);
-  ctx.rotate(-0.45 + Math.sin(t * 2.2) * 0.04);
-  ctx.beginPath();
-  ctx.moveTo(-r * 0.1, r * 0.34);
-  ctx.quadraticCurveTo(-r * 0.02, -r * 0.32, r * 0.36, -r * 0.12);
-  ctx.lineTo(r * 0.12, r * 0.2);
-  ctx.closePath();
-  ctx.fillStyle = '#E4EBF0';
-  ctx.fill();
-  ctx.strokeStyle = '#7B8794';
-  ctx.lineWidth = 1;
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.moveTo(-r * 0.12, r * 0.32);
-  ctx.lineTo(-r * 0.26, r * 0.46);
-  ctx.strokeStyle = '#7A4A22';
-  ctx.lineWidth = 5;
-  ctx.lineCap = 'round';
-  ctx.stroke();
-  ctx.restore();
-
-  ctx.restore();
-
-  // 飘着的皮
-  var pt = (t * 0.6) % 1;
-  ctx.save();
-  ctx.globalAlpha = 0.55 * (1 - pt);
-  ctx.strokeStyle = '#B0743E';
-  ctx.lineWidth = 2.2;
-  ctx.beginPath();
-  ctx.arc(cx - r * 0.95 - pt * 20, cy + r * 0.3 - pt * 26, 5, 0.4, 2.6);
-  ctx.stroke();
-  ctx.restore();
-};
-
-MenuScene.prototype.drawOrderCard = function (ctx, t) {
-  var o = this.order;
-  var x = this.cardX;
-  var y = this.cardY;
-  var w = this.cardW;
-  var h = this.cardH;
-
-  ctx.save();
-  UI.shadow(ctx, 'rgba(90,55,22,0.22)', 18, 0, 8);
-  UI.fillRR(ctx, x, y, w, h, 20, '#FFF8E8');
-  UI.clearShadow(ctx);
-  UI.strokeRR(ctx, x, y, w, h, 20, 'rgba(150,103,52,0.28)', 1.5);
-
-  UI.fillRR(ctx, x + 16, y + 14, 78, 24, 12, 'rgba(111,168,94,0.16)');
-  UI.text(ctx, '军需订单', x + 55, y + 26, 11.5, T.greenDark, 'center', 800);
-  UI.text(ctx, '#' + o.index, x + w - 18, y + 26, 12, T.inkSoft, 'right', 800);
-
-  UI.text(ctx, '土豆 × ' + o.count, x + 18, y + 56, 28, T.ink, 'left', 900);
-  var targetLine = '目标削净 ' + Math.round(o.target * 100) + '% · 限时 ' + o.timeLimit + 's';
-  if (o.goldenIndex >= 0 && h < 166) targetLine += ' · 金土豆★';
-  UI.text(ctx, targetLine, x + 18, y + (h < 166 ? 82 : 84), 12, T.inkSoft, 'left', 600);
-
-  // 收益
-  var coinX = x + w - 66;
-  UI.drawCoin(ctx, coinX, y + 58, 13, true);
-  UI.text(ctx, '+' + o.baseCoins, x + w - 46, y + 58, 22, T.goldDark, 'left', 900);
-  UI.text(ctx, '基础收益', x + w - 18, y + 80, 10, T.inkSoft, 'right', 600);
-
-  if (o.goldenIndex >= 0 && h >= 166) {
-    UI.pill(ctx, x + 18, y + 93, 82, 20, 'rgba(242,184,75,0.2)');
-    UI.drawIcon(ctx, 'star', x + 30, y + 103, 12, T.gold);
-    UI.text(ctx, '金土豆订单', x + 62, y + 103, 10, T.goldDark, 'center', 800);
-  }
-
-  var btn = UI.makeButton({
-    x: x + 14, y: y + h - 56, w: w - 28, h: 46, radius: 15,
-    label: '开 始 削 皮', kind: 'primary', size: 19
-  });
-  btn.pressed = this.isPressed('play');
-  UI.button(ctx, btn);
-  ctx.restore();
-};
-
-MenuScene.prototype.drawTiles = function (ctx) {
-  var tiles = [
-    { action: 'shop', icon: 'shop', label: '军需商店', sub: '升级装备' },
-    { action: 'daily', icon: 'calendar', label: '每日补给', sub: this.daily.claimedToday ? '已领取' : '可领取' },
-    { action: 'tasks', icon: 'star', label: '今日任务', sub: this.questClaimable > 0 ? this.questClaimable + ' 个可领' : '进行中' }
-  ];
-  for (var i = 0; i < tiles.length; i++) {
-    var it = tiles[i];
-    var x = this.cardX + i * (this.tileW + this.tileGap);
-    var y = this.rowY + (this.isPressed(it.action) ? 2 : 0);
-    var w = this.tileW;
-    var h = this.rowH;
-
-    UI.fillRR(ctx, x, y + 3, w, h, 16, 'rgba(122,78,32,0.18)');
-    UI.fillRR(ctx, x, y, w, h, 16, '#FFF7E6');
-    UI.strokeRR(ctx, x, y, w, h, 16, 'rgba(150,103,52,0.26)', 1);
-    UI.drawIcon(ctx, it.icon, x + w / 2, y + 20, 20, T.ink);
-    UI.text(ctx, it.label, x + w / 2, y + 40, 11.5, T.ink, 'center', 800);
-    UI.text(ctx, it.sub, x + w / 2, y + 52, 9, T.inkSoft, 'center', 600);
-
-    if (it.action === 'daily' && !this.daily.claimedToday) {
-      ctx.beginPath();
-      ctx.arc(x + w - 10, y + 10, 5, 0, Math.PI * 2);
-      ctx.fillStyle = T.red;
-      ctx.fill();
-    }
-    if (it.action === 'tasks' && this.questClaimable > 0) {
-      ctx.beginPath();
-      ctx.arc(x + w - 10, y + 10, 8, 0, Math.PI * 2);
-      ctx.fillStyle = T.red;
-      ctx.fill();
-      UI.text(ctx, String(this.questClaimable), x + w - 10, y + 10, 9, '#FFF', 'center', 800);
-    }
-  }
-};
-
-MenuScene.prototype.drawPile = function (ctx, t) {
-  var top = this.pileTop;
-  var bottom = this.pileBottom;
-  var avail = bottom - top;
-  if (avail < 105) {
-    if (avail < 34) return;
-    var stats = '已削 ' + Economy.s.potatoesPeeled + ' 颗 · S 评级 ' + Economy.s.sGrades + ' · 最佳订单 #' + Economy.s.bestOrder;
-    var sw = Math.min(this.W - 60, UI.measure(ctx, stats, 10, 700) + 40);
-    var sy = (top + bottom) / 2 - 17;
-    UI.pill(ctx, (this.W - sw) / 2, sy, sw, 34, 'rgba(255,248,232,0.6)', 'rgba(150,103,52,0.2)');
-    UI.text(ctx, stats, this.W / 2, sy + 17, 10, 'rgba(94,58,28,0.65)', 'center', 700);
-    return;
-  }
-  var W = this.W;
-  var s = Math.max(0.62, Math.min(1, avail / 205));
-  var cx = W * 0.5;
-  var baseY = bottom - 8;
-  var bw = 132 * s;
-  var bh = 80 * s;
-
-  ctx.save();
-  // 背后的暖光
-  var glow = ctx.createRadialGradient(cx, top + avail * 0.55, 6, cx, top + avail * 0.55, 120 * s);
-  glow.addColorStop(0, 'rgba(255,244,210,0.5)');
-  glow.addColorStop(1, 'rgba(255,244,210,0)');
-  ctx.fillStyle = glow;
-  ctx.fillRect(cx - 140 * s, top, 280 * s, avail);
-
-  var headText = '累计削皮 ' + Economy.s.potatoesPeeled + ' 颗';
-  var headW = Math.max(112, Math.min(158, UI.measure(ctx, headText, 9.5, 600) + 34));
-  UI.pill(ctx, cx - headW / 2, top + 3, headW, 40, 'rgba(255,248,232,0.62)');
-  UI.text(ctx, '土 豆 山', cx, top + 14, 13, 'rgba(94,58,28,0.66)', 'center', 900);
-  UI.text(ctx, headText, cx, top + 31, 9.5, 'rgba(94,58,28,0.5)', 'center', 600);
-
-  // 堆叠的土豆
-  var rows = [
-    { n: 5, y: -7, sp: 27 },
-    { n: 4, y: -27, sp: 28 },
-    { n: 3, y: -46, sp: 29 },
-    { n: 2, y: -64, sp: 30 }
-  ];
-  for (var r = 0; r < rows.length; r++) {
-    var row = rows[r];
-    for (var i = 0; i < row.n; i++) {
-      var off = (i - (row.n - 1) / 2) * row.sp * s;
-      var px = cx + off;
-      var py = baseY - bh + row.y * s;
-      var rx = 20 * s * (0.94 + (i % 2) * 0.08);
-      var ry = 15 * s;
-      ctx.save();
-      ctx.translate(px, py);
-      ctx.rotate((i % 3 - 1) * 0.12);
-      ctx.beginPath();
-      ctx.ellipse ? ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2) : ctx.arc(0, 0, rx, 0, Math.PI * 2);
-      var pg = ctx.createRadialGradient(-rx * 0.3, -ry * 0.35, 1, 0, 0, rx);
-      pg.addColorStop(0, '#CE9A63');
-      pg.addColorStop(0.65, '#B0743E');
-      pg.addColorStop(1, '#84501F');
-      ctx.fillStyle = pg;
-      ctx.fill();
-      ctx.beginPath();
-      ctx.ellipse ? ctx.ellipse(-rx * 0.34, -ry * 0.36, rx * 0.22, ry * 0.24, 0, 0, Math.PI * 2) :
-        ctx.arc(-rx * 0.3, -ry * 0.3, rx * 0.2, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(255,235,190,0.4)';
-      ctx.fill();
-      ctx.restore();
-    }
-  }
-
-  // 木桶
-  ctx.beginPath();
-  ctx.moveTo(cx - bw / 2, baseY - bh);
-  ctx.lineTo(cx + bw / 2, baseY - bh);
-  ctx.lineTo(cx + bw * 0.38, baseY);
-  ctx.lineTo(cx - bw * 0.38, baseY);
-  ctx.closePath();
-  var bg = ctx.createLinearGradient(cx - bw / 2, 0, cx + bw / 2, 0);
-  bg.addColorStop(0, '#8E5B2D');
-  bg.addColorStop(0.35, '#C08A50');
-  bg.addColorStop(0.7, '#A9743C');
-  bg.addColorStop(1, '#7A4A22');
-  ctx.fillStyle = bg;
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(70,40,15,0.35)';
-  ctx.lineWidth = 1.4;
-  ctx.stroke();
-
-  // 水
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(cx, baseY - bh + 2, bw * 0.44, 8 * s, 0, 0, Math.PI * 2) :
-    ctx.arc(cx, baseY - bh + 2, bw * 0.4, 0, Math.PI * 2);
-  ctx.fillStyle = '#7FA9B6';
-  ctx.fill();
-  ctx.strokeStyle = '#D8E8EA';
-  ctx.lineWidth = 2 * s;
-  ctx.stroke();
-
-  // 桶沿
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(cx, baseY - bh, bw * 0.5, 9 * s, 0, 0, Math.PI * 2) :
-    ctx.arc(cx, baseY - bh, bw * 0.48, 0, Math.PI * 2);
-  ctx.strokeStyle = '#6E4520';
-  ctx.lineWidth = 5 * s;
-  ctx.stroke();
-
-  // 桶箍
-  ctx.beginPath();
-  ctx.moveTo(cx - bw * 0.47, baseY - bh * 0.62);
-  ctx.lineTo(cx + bw * 0.47, baseY - bh * 0.62);
-  ctx.strokeStyle = 'rgba(90,55,25,0.45)';
-  ctx.lineWidth = 5 * s;
-  ctx.stroke();
-
-  // 削好的土豆
-  for (var k = 0; k < 3; k++) {
-    var px2 = cx + (k - 1) * 18 * s;
-    var py2 = baseY - bh + 1 + (k % 2) * 3 * s;
-    ctx.beginPath();
-    ctx.ellipse ? ctx.ellipse(px2, py2, 11 * s, 7 * s, 0.2, 0, Math.PI * 2) :
-      ctx.arc(px2, py2, 9 * s, 0, Math.PI * 2);
-    ctx.fillStyle = '#F8E6B4';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(150,104,45,0.35)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-  }
-
-  // 热气
-  for (var m = 0; m < 2; m++) {
-    var rise = (t * 0.35 + m * 0.5) % 1;
-    ctx.beginPath();
-    ctx.globalAlpha = 0.18 * (1 - rise);
-    ctx.strokeStyle = '#FFF8E0';
-    ctx.lineWidth = 2.4;
-    ctx.beginPath();
-    ctx.moveTo(cx + (m ? 18 : -14) * s, baseY - bh - 8 - rise * 28);
-    ctx.quadraticCurveTo(cx + (m ? 30 : -26) * s, baseY - bh - 22 - rise * 32, cx + (m ? 16 : -12) * s, baseY - bh - 38 - rise * 36);
-    ctx.stroke();
-  }
-  ctx.restore();
-};
-
-MenuScene.prototype.drawIdleBar = function (ctx) {
-  var W = this.W;
-  var x = 18;
-  var y = this.idleY;
-  var w = W - 36;
-  var h = this.idleH;
-  var info = this.idle;
-
-  UI.fillRR(ctx, x, y, w, h, 16, 'rgba(255,248,232,0.94)');
-  UI.strokeRR(ctx, x, y, w, h, 16, info.rate > 0 ? 'rgba(242,184,75,0.65)' : 'rgba(150,103,52,0.24)', 1.5);
-  UI.drawIcon(ctx, 'machine', x + 28, y + h / 2, 22, info.rate > 0 ? T.goldDark : T.inkSoft);
-
-  if (info.rate > 0) {
-    UI.text(ctx, '自动削皮机', x + 50, y + 18, 11, T.inkSoft, 'left', 700);
-    if (info.pending >= 1) {
-      UI.text(ctx, '+' + info.pending + ' 待收取', x + 50, y + 36, 14, T.goldDark, 'left', 900);
-    } else {
-      UI.text(ctx, '运转中 · ' + info.rate + ' 币/分', x + 50, y + 36, 12, T.ink, 'left', 700);
-    }
-  } else {
-    UI.text(ctx, '自动削皮机未解锁', x + 50, y + 19, 12, T.ink, 'left', 800);
-    UI.text(ctx, '离线也能替你攒土豆币', x + 50, y + 35, 10, T.inkSoft, 'left', 600);
-  }
-
-  if (info.rate > 0 && info.pending >= 1) {
-    var b1 = UI.makeButton({
-      x: W - 18 - 122, y: y + 10, w: 56, h: 34, radius: 12,
-      label: '领取', kind: 'secondary', size: 12
-    });
-    var b2 = UI.makeButton({
-      x: W - 18 - 62, y: y + 10, w: 62, h: 34, radius: 12,
-      label: '视频×2', kind: 'gold', size: 11
-    });
-    b1.pressed = this.isPressed('idleCollect');
-    b2.pressed = this.isPressed('idleDouble');
-    UI.button(ctx, b1);
-    UI.button(ctx, b2);
-  } else {
-    var b3 = UI.makeButton({
-      x: W - 18 - 86, y: y + 10, w: 86, h: 34, radius: 12,
-      label: info.rate > 0 ? '运转中' : '去解锁', kind: info.rate > 0 ? 'secondary' : 'primary', size: 11.5
-    });
-    b3.pressed = this.isPressed('idleGo');
-    b3.enabled = true;
-    UI.button(ctx, b3);
-  }
-};
-
-MenuScene.prototype.drawBanner = function (ctx) {
-  if (!Ads.isDemo() || !CONFIG.ads.demoAds) return;
-  var W = this.W;
-  var y = this.bannerY;
-  ctx.save();
-  ctx.setLineDash ? ctx.setLineDash([5, 4]) : null;
-  UI.strokeRR(ctx, 18, y, W - 36, 46, 10, 'rgba(126,90,56,0.28)', 1);
-  if (ctx.setLineDash) ctx.setLineDash([]);
-  UI.text(ctx, 'Banner 广告位 · 微信流量主接入后展示', W / 2, y + 23, 9.5, 'rgba(126,90,56,0.65)', 'center', 600);
-  ctx.restore();
-};
-
-MenuScene.prototype.isPressed = function (action) {
-  return this.active && this.active.action === action;
-};
-
-MenuScene.prototype.onDown = function (p) {
-  if (this.overlay) {
-    if (this.overlay.onDown) this.overlay.onDown(p);
-    return;
-  }
-  var a = this.hitAt(p.x, p.y);
-  if (a) {
-    this.active = a;
-    Sound.tap();
-  }
-};
-
-MenuScene.prototype.onMove = function (p) {
-  if (this.overlay && this.overlay.onMove) this.overlay.onMove(p);
-};
-
-MenuScene.prototype.onUp = function (p) {
-  if (this.overlay) {
-    if (this.overlay.onUp) this.overlay.onUp(p);
-    if (this.overlay && this.overlay.closed) {
-      this.overlay = null;
-      Ads.showBanner();
-      Economy.refresh();
-      this.refresh();
-    }
-    return;
-  }
-  var a = this.active;
-  this.active = null;
-  if (!a) return;
-  if (!UI.hit(a, p.x, p.y)) return;
-  this.activate(a.action);
-};
-
-MenuScene.prototype.hitAt = function (x, y) {
-  for (var i = this.areas.length - 1; i >= 0; i--) {
-    if (UI.hit(this.areas[i], x, y)) return this.areas[i];
-  }
-  return null;
-};
-
-MenuScene.prototype.activate = function (action) {
-  var self = this;
-  if (action === 'play') {
-    Platform.haptic('medium');
-    this.main.startOrder();
-  } else if (action === 'sound') {
-    var on = !Economy.s.settings.sound;
-    Economy.setSetting('sound', on);
-    Sound.setMuted(!on);
-    if (on) Sound.tap();
-    this.main.notify(on ? '音效已开启' : '音效已关闭');
-  } else if (action === 'settings') {
-    this.openOverlay(new SettingsOverlay(this.main, function () { self.closeOverlay(); }));
-  } else if (action === 'share') {
-    this.main.shareGame();
-  } else if (action === 'shop') {
-    this.openOverlay(new ShopOverlay(this.main, function () { self.closeOverlay(); }));
-  } else if (action === 'daily') {
-    this.openOverlay(new DailyOverlay(this.main, 'daily', function () { self.closeOverlay(); }));
-  } else if (action === 'tasks') {
-    this.openOverlay(new DailyOverlay(this.main, 'tasks', function () { self.closeOverlay(); }));
-  } else if (action === 'idleCollect') {
-    var r = Economy.collectIdle(false);
-    if (r.ok) {
-      Sound.coin();
-      this.main.notify('已收取 ' + r.coins + ' 土豆币');
-      this.refresh();
-    }
-  } else if (action === 'idleDouble') {
-    var rr = Economy.collectIdle(true);
-    if (rr.ok) {
-      Sound.reward();
-      this.main.notify('双倍收取 ' + rr.coins + ' 土豆币');
-      this.refresh();
-    }
-  } else if (action === 'idleGo') {
-    if (this.idle.rate > 0) {
-      this.main.notify('机器正在运转，稍后再来收');
-    } else {
-      this.openOverlay(new ShopOverlay(this.main, function () { self.closeOverlay(); }, 'machine'));
-    }
-  }
-};
-
-MenuScene.prototype.openOverlay = function (o) {
-  this.overlay = o;
-  Ads.hideBanner();
-};
-
-MenuScene.prototype.closeOverlay = function () {
-  this.overlay = null;
-  Ads.showBanner();
-  Economy.refresh();
-  this.refresh();
-};
-
-MenuScene.prototype.onEscape = function () {
-  if (this.overlay) this.closeOverlay();
-};
-
-module.exports = MenuScene;
-
-};
-__defs["scenes/shop"] = function(module, exports, require){
-/**
- * 军需商店：装备升级 + 免费补给箱（激励视频）。
- */
-var CONFIG = require('../config');
-var Platform = require('../platform');
-var Economy = require('../economy');
-var Ads = require('../ads');
-var Sound = require('../audio');
-var UI = require('../ui');
-var T = UI.T;
-
-function fmtMs(ms) {
-  var s = Math.ceil(ms / 1000);
-  var h = Math.floor(s / 3600);
-  var m = Math.floor((s % 3600) / 60);
-  var sec = s % 60;
-  function p(n) { return n < 10 ? '0' + n : '' + n; }
-  return h > 0 ? h + ':' + p(m) + ':' + p(sec) : p(m) + ':' + p(sec);
-}
-
-function ShopOverlay(main, onClose, focusId) {
-  this.main = main;
-  this.onClose = onClose;
-  this.focusId = focusId || null;
-  this.closed = false;
-  this.active = null;
-  this.t = 0;
-  this.layout();
-}
-
-ShopOverlay.prototype.layout = function () {
-  var W = this.main.W;
-  var H = this.main.H;
-  this.W = W;
-  this.H = H;
-  this.x = 12;
-  this.w = W - 24;
-  this.pad = 14;
-  this.headerH = 52;
-  this.chestH = 62;
-  this.cardGap = 7;
-  var n = CONFIG.upgrades.length;
-  var hMax = H - Platform.safeTop - 78;
-  var fixed = this.headerH + 8 + this.chestH + 10 + (n - 1) * this.cardGap + 30 + 16;
-  this.cardH = Math.max(54, Math.min(72, (hMax - fixed) / n));
-  var content = fixed + n * this.cardH;
-  this.h = Math.min(hMax, content);
-  this.y = H - Platform.safeBottom - 12 - this.h;
-  this.chestY = this.y + this.headerH + 8;
-  this.listY = this.chestY + this.chestH + 10;
-  this.refresh();
-};
-
-ShopOverlay.prototype.refresh = function () {
-  var self = this;
-  var list = [];
-  var defs = CONFIG.upgrades;
-  var chest = Economy.chestInfo();
-  this.chest = chest;
-
-  this.closeBtn = { x: this.x + this.w - 46, y: this.y + 10, w: 36, h: 36, action: 'close' };
-  this.chestBtn = {
-    x: this.x + this.w - 14 - 88, y: this.chestY + 15, w: 88, h: 32,
-    action: 'chest', pressed: false, enabled: chest.ready
-  };
-  list.push(this.chestBtn);
-
-  for (var i = 0; i < defs.length; i++) {
-    var d = defs[i];
-    var cost = Economy.upgradeCost(d.id);
-    var lv = Economy.level(d.id);
-    var cy = this.listY + i * (this.cardH + this.cardGap);
-    list.push({
-      x: this.x + this.w - 14 - 92,
-      y: cy + (this.cardH - 32) / 2,
-      w: 92,
-      h: 32,
-      action: 'buy:' + d.id,
-      id: d.id,
-      cost: cost,
-      level: lv,
-      max: lv >= d.max,
-      affordable: cost !== null && Economy.s.coins >= cost,
-      pressed: false
-    });
-  }
-  this.list = list;
-};
-
-ShopOverlay.prototype.render = function (ctx) {
-  var W = this.W;
-  var H = this.H;
-  UI.dim(ctx, W, H, 0.58);
-
-  ctx.save();
-  UI.shadow(ctx, 'rgba(0,0,0,0.35)', 26, 0, 10);
-  UI.fillRR(ctx, this.x, this.y, this.w, this.h, 24, '#FFF8E8');
-  UI.clearShadow(ctx);
-
-  // 顶部拖拽条
-  UI.fillRR(ctx, W / 2 - 20, this.y + 7, 40, 4, 2, 'rgba(126,90,56,0.22)');
-
-  // 标题
-  UI.text(ctx, '军需商店', this.x + 20, this.y + 32, 22, T.ink, 'left', 900);
-  var cw = 100;
-  var cx = this.x + this.w - 14 - 36 - 8 - cw;
-  UI.pill(ctx, cx, this.y + 16, cw, 32, 'rgba(255,248,232,0.95)', 'rgba(150,103,52,0.3)');
-  UI.drawCoin(ctx, cx + 18, this.y + 32, 10);
-  UI.text(ctx, String(Economy.s.coins), cx + cw - 10, this.y + 32, 15, T.ink, 'right', 800);
-
-  // 关闭
-  UI.fillRR(ctx, this.closeBtn.x, this.closeBtn.y, 36, 36, 12, 'rgba(126,90,56,0.09)');
-  UI.drawIcon(ctx, 'close', this.closeBtn.x + 18, this.closeBtn.y + 18, 17, T.inkSoft);
-
-  // 免费补给箱
-  var gx = this.x + 14;
-  var gy = this.chestY;
-  var gw = this.w - 28;
-  var gg = ctx.createLinearGradient(gx, gy, gx + gw, gy);
-  gg.addColorStop(0, '#FBE3AE');
-  gg.addColorStop(1, '#F3C97C');
-  UI.fillRR(ctx, gx, gy, gw, this.chestH, 16, gg);
-  UI.strokeRR(ctx, gx, gy, gw, this.chestH, 16, 'rgba(201,139,36,0.35)', 1);
-  UI.drawIcon(ctx, 'gift', gx + 30, gy + this.chestH / 2, 26, '#B76A4A');
-  UI.text(ctx, '免费补给箱', gx + 52, gy + 22, 14, '#7A4A22', 'left', 900);
-  UI.text(ctx, this.chest.ready ? '看视频领 ' + CONFIG.chest.minCoins + '-' + CONFIG.chest.maxCoins + ' 土豆币' : fmtMs(this.chest.remainMs) + ' 后可再领',
-    gx + 52, gy + 42, 10, 'rgba(122,74,34,0.8)', 'left', 600);
-
-  var cb = UI.makeButton({
-    x: this.chestBtn.x, y: this.chestBtn.y, w: this.chestBtn.w, h: this.chestBtn.h,
-    radius: 11, label: this.chest.ready ? '看视频' : '冷却中',
-    kind: 'gold', size: 11, enabled: this.chest.ready
-  });
-  cb.pressed = this.chestBtn.pressed;
-  UI.button(ctx, cb);
-
-  // 装备列表
-  for (var i = 0; i < CONFIG.upgrades.length; i++) {
-    var d = CONFIG.upgrades[i];
-    var cy = this.listY + i * (this.cardH + this.cardGap);
-    var focused = this.focusId === d.id;
-    UI.fillRR(ctx, this.x + 14, cy, this.w - 28, this.cardH, 14, focused ? '#FEF0D3' : '#F8EBCE');
-    UI.strokeRR(ctx, this.x + 14, cy, this.w - 28, this.cardH, 14, focused ? 'rgba(242,184,75,0.8)' : 'rgba(150,103,52,0.2)', 1.2);
-
-    // icon
-    var ir = Math.min(20, this.cardH * 0.32);
-    ctx.beginPath();
-    ctx.arc(this.x + 40, cy + this.cardH / 2, ir, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(184,122,66,0.14)';
-    ctx.fill();
-    UI.drawIcon(ctx, d.icon, this.x + 40, cy + this.cardH / 2, ir * 1.15, T.ink);
-
-    var lv = Economy.level(d.id);
-    var nameY = this.cardH >= 66 ? cy + 18 : cy + this.cardH / 2 - 8;
-    var effectY = this.cardH >= 66 ? cy + 36 : cy + this.cardH / 2 + 9;
-    UI.text(ctx, d.name, this.x + 66, nameY, 14, T.ink, 'left', 900);
-    var nameW = UI.measure(ctx, d.name, 14, 900);
-    UI.pill(ctx, this.x + 66 + nameW + 7, nameY - 8, 34, 17, 'rgba(111,168,94,0.16)');
-    UI.text(ctx, 'Lv.' + lv, this.x + 66 + nameW + 24, nameY - 0, 9.5, T.greenDark, 'center', 800);
-
-    UI.text(ctx, Economy.effectText(d.id), this.x + 66, effectY, 10, T.inkSoft, 'left', 600);
-    if (this.cardH >= 66) UI.text(ctx, d.brief, this.x + 66, cy + 51, 9, 'rgba(126,90,56,0.7)', 'left', 600);
-
-    var b = null;
-    for (var k = 0; k < this.list.length; k++) {
-      if (this.list[k].action === 'buy:' + d.id) { b = this.list[k]; break; }
-    }
-    if (b) {
-      var label = b.max ? '已满级' : (b.cost != null ? '升级 ' + b.cost : '—');
-      var kind = b.max ? 'secondary' : (b.affordable ? 'primary' : 'secondary');
-      var btn = UI.makeButton({
-        x: b.x, y: b.y, w: b.w, h: b.h, radius: 12,
-        label: label, kind: kind, size: 11, enabled: !b.max && b.affordable
-      });
-      btn.pressed = b.pressed;
-      UI.button(ctx, btn);
-    }
-  }
-
-  UI.text(ctx, '装备永久生效 · 广告收入用于军需处运转', W / 2, this.y + this.h - 12, 9, 'rgba(126,90,56,0.55)', 'center', 600);
-  ctx.restore();
-};
-
-ShopOverlay.prototype.update = function (dt) {
-  this.t += dt;
-};
-
-ShopOverlay.prototype.onDown = function (p) {
-  this.active = null;
-  if (UI.hit(this.closeBtn, p.x, p.y)) { this.active = this.closeBtn; return; }
-  for (var i = 0; i < this.list.length; i++) {
-    var b = this.list[i];
-    if (b.enabled !== false && UI.hit(b, p.x, p.y)) { this.active = b; b.pressed = true; Sound.tap(); return; }
-  }
-};
-
-ShopOverlay.prototype.onUp = function (p) {
-  var a = this.active;
-  this.active = null;
-  if (a) a.pressed = false;
-  if (!a || !UI.hit(a, p.x, p.y)) return;
-
-  if (a.action === 'close') {
-    this.closed = true;
-    if (this.onClose) this.onClose();
-  } else if (a.action === 'chest') {
-    this.claimChest();
-  } else if (a.action.indexOf('buy:') === 0) {
-    this.buy(a.action.slice(4));
-  }
-};
-
-ShopOverlay.prototype.claimChest = function () {
-  var self = this;
-  var info = Economy.chestInfo();
-  if (!info.ready) { this.main.notify('补给箱还在冷却中'); return; }
-  this.main.rewarded('free_chest', function () {
-    var r = Economy.claimChest();
-    if (r.ok) {
-      Sound.coin();
-      self.main.notify('补给箱 +' + r.coins + ' 土豆币');
-      self.refresh();
-    }
-  });
-};
-
-ShopOverlay.prototype.buy = function (id) {
-  var r = Economy.buyUpgrade(id);
-  if (r.ok) {
-    Sound.upgrade();
-    Platform.haptic('medium');
-    this.main.notify('升级成功 · Lv.' + r.level);
-    this.refresh();
-  } else if (r.reason === 'coins') {
-    this.main.notify('土豆币不够，还差 ' + (r.cost - Economy.s.coins));
-	} else if (r.reason === 'max') {
-    this.main.notify('已经满级了');
-  }
-};
-
-module.exports = ShopOverlay;
-
-};
-__defs["scenes/daily"] = function(module, exports, require){
-/**
- * 每日补给 + 今日任务。
- */
-var CONFIG = require('../config');
-var Platform = require('../platform');
-var Economy = require('../economy');
-var Sound = require('../audio');
-var UI = require('../ui');
-var T = UI.T;
-
-function DailyOverlay(main, mode, onClose) {
-  this.main = main;
-  this.mode = mode === 'tasks' ? 'tasks' : 'daily';
-  this.onClose = onClose;
-  this.closed = false;
-  this.active = null;
-  this.t = 0;
-  this.layout();
-}
-
-DailyOverlay.prototype.layout = function () {
-  var W = this.main.W;
-  var H = this.main.H;
-  this.W = W;
-  this.H = H;
-  this.x = 12;
-  this.w = W - 24;
-  var avail = H - Platform.safeTop - 100;
-  this.h = Math.min(avail, this.mode === 'daily' ? 302 : 386);
-  this.y = H - Platform.safeBottom - 12 - this.h;
-  this.closeBtn = { x: this.x + this.w - 46, y: this.y + 10, w: 36, h: 36 };
-  this.tabY = this.y + 50;
-  this.tabH = 36;
-  this.contentY = this.tabY + this.tabH + 12;
-  this.refresh();
-};
-
-DailyOverlay.prototype.refresh = function () {
-  this.daily = Economy.dailyInfo();
-  this.quests = Economy.questList();
-  var W = this.W;
-  var contentX = this.x + 14;
-  var contentW = this.w - 28;
-
-  var tabW = (contentW - 8) / 2;
-  this.tabs = [
-    { x: contentX, y: this.tabY, w: tabW, h: this.tabH, mode: 'daily', label: '每日补给' },
-    { x: contentX + tabW + 8, y: this.tabY, w: tabW, h: this.tabH, mode: 'tasks', label: '今日任务' }
-  ];
-
-  var buttons = [];
-  if (this.mode === 'daily') {
-    this.tileGap = 4;
-    this.tileW = (contentW - this.tileGap * 6) / 7;
-    this.tileH = 72;
-    this.gridY = this.contentY + 6;
-    this.claimBtn = {
-      x: contentX, y: this.gridY + this.tileH + 16, w: contentW, h: 46,
-      action: 'dailyClaim', pressed: false
-    };
-    this.doubleBtn = {
-      x: contentX, y: this.gridY + this.tileH + 16, w: contentW, h: 46,
-      action: 'dailyDouble', pressed: false
-    };
-    buttons.push(this.daily.claimedToday && this.daily.doubleAvailable ? this.doubleBtn : this.claimBtn);
-  } else {
-    this.rowGap = 7;
-    this.rowH = Math.max(52, Math.min(64, (this.h - (this.contentY - this.y) - 30 - this.rowGap * 3) / 4));
-    this.questBtns = [];
-    for (var i = 0; i < this.quests.length; i++) {
-      var q = this.quests[i];
-      buttons.push({
-        x: contentX + contentW - 74,
-        y: this.contentY + i * (this.rowH + this.rowGap) + (this.rowH - 30) / 2,
-        w: 74, h: 30, action: 'quest:' + q.id, pressed: false, id: q.id, enabled: q.canClaim
-      });
-    }
-  }
-  this.buttons = buttons;
-};
-
-DailyOverlay.prototype.render = function (ctx) {
-  var W = this.W;
-  var H = this.H;
-  UI.dim(ctx, W, H, 0.58);
-
-  ctx.save();
-  UI.shadow(ctx, 'rgba(0,0,0,0.35)', 26, 0, 10);
-  UI.fillRR(ctx, this.x, this.y, this.w, this.h, 24, '#FFF8E8');
-  UI.clearShadow(ctx);
-  UI.fillRR(ctx, W / 2 - 20, this.y + 7, 40, 4, 2, 'rgba(126,90,56,0.22)');
-
-  UI.text(ctx, this.mode === 'daily' ? '每日补给' : '今日任务', this.x + 20, this.y + 32, 22, T.ink, 'left', 900);
-  var cw = 100;
-  var cx = this.x + this.w - 14 - 36 - 8 - cw;
-  UI.pill(ctx, cx, this.y + 16, cw, 32, 'rgba(255,248,232,0.95)', 'rgba(150,103,52,0.3)');
-  UI.drawCoin(ctx, cx + 18, this.y + 32, 10);
-  UI.text(ctx, String(Economy.s.coins), cx + cw - 10, this.y + 32, 15, T.ink, 'right', 800);
-  UI.fillRR(ctx, this.closeBtn.x, this.closeBtn.y, 36, 36, 12, 'rgba(126,90,56,0.09)');
-  UI.drawIcon(ctx, 'close', this.closeBtn.x + 18, this.closeBtn.y + 18, 17, T.inkSoft);
-
-  // tabs
-  for (var i = 0; i < this.tabs.length; i++) {
-    var tab = this.tabs[i];
-    var on = tab.mode === this.mode;
-    UI.fillRR(ctx, tab.x, tab.y, tab.w, tab.h, 12, on ? '#6FA85E' : 'rgba(126,90,56,0.08)');
-    UI.text(ctx, tab.label, tab.x + tab.w / 2, tab.y + tab.h / 2, 13, on ? '#FFFDF4' : T.inkSoft, 'center', 800);
-  }
-
-  if (this.mode === 'daily') {
-    this.renderDaily(ctx);
-  } else {
-    this.renderTasks(ctx);
-  }
-
-  UI.text(ctx, '每日 0 点刷新 · 看广告可获得额外收益', W / 2, this.y + this.h - 12, 9, 'rgba(126,90,56,0.55)', 'center', 600);
-  ctx.restore();
-};
-
-DailyOverlay.prototype.renderDaily = function (ctx) {
-  var x = this.x + 14;
-  var y = this.gridY;
-  var info = this.daily;
-  var streak = Economy.s.daily.streak || 0;
-  var claimedCount = info.claimedToday ? ((Math.max(1, streak) - 1) % 7) + 1 : streak % 7;
-  var todayIndex = info.day;
-
-  for (var i = 0; i < 7; i++) {
-    var tx = x + i * (this.tileW + this.tileGap);
-    var claimed = (i + 1) <= claimedCount;
-    var isToday = (i + 1) === todayIndex;
-    var fill = claimed ? 'rgba(111,168,94,0.18)' : (isToday ? '#FCE3A9' : 'rgba(126,90,56,0.06)');
-    UI.fillRR(ctx, tx, y, this.tileW, this.tileH, 10, fill);
-    if (isToday) UI.strokeRR(ctx, tx, y, this.tileW, this.tileH, 10, 'rgba(242,184,75,0.9)', 1.6);
-    UI.text(ctx, 'D' + (i + 1), tx + this.tileW / 2, y + 14, 9.5, claimed ? T.greenDark : T.inkSoft, 'center', 800);
-    UI.drawCoin(ctx, tx + this.tileW / 2, y + 35, 8.5);
-    UI.text(ctx, String(CONFIG.dailyRewards[i]), tx + this.tileW / 2, y + 54, 11, claimed ? T.greenDark : T.ink, 'center', 800);
-    if (claimed) {
-      ctx.beginPath();
-      ctx.arc(tx + this.tileW - 8, y + 8, 7, 0, Math.PI * 2);
-      ctx.fillStyle = T.green;
-      ctx.fill();
-      UI.drawIcon(ctx, 'check', tx + this.tileW - 8, y + 8, 8, '#FFF');
-    }
-  }
-
-  UI.text(ctx, '连续登录第 ' + Math.max(1, info.claimedToday ? streak : info.nextStreak) + ' 天', x, y + this.tileH + 3, 10.5, T.inkSoft, 'left', 600);
-
-  var showDouble = info.claimedToday && info.doubleAvailable;
-  var b;
-  if (showDouble) {
-    b = UI.makeButton({
-      x: this.doubleBtn.x, y: this.doubleBtn.y, w: this.doubleBtn.w, h: this.doubleBtn.h,
-      radius: 15, label: '看视频再翻倍 +' + (info.lastReward || 0), kind: 'gold', size: 15
-    });
-    b.pressed = this.doubleBtn.pressed;
-    UI.button(ctx, b);
-  } else {
-    var label = info.claimedToday ? '今日已领取' : '领取第 ' + info.day + ' 天 +' + info.reward;
-    b = UI.makeButton({
-      x: this.claimBtn.x, y: this.claimBtn.y, w: this.claimBtn.w, h: this.claimBtn.h,
-      radius: 15, label: label, kind: info.claimedToday ? 'secondary' : 'primary', size: 15,
-      enabled: !info.claimedToday
-    });
-    b.pressed = this.claimBtn.pressed;
-    UI.button(ctx, b);
-  }
-
-  UI.text(ctx, '提示：补给箱与每日奖励都可以用激励视频翻倍', this.W / 2, this.claimBtn.y + 66, 9.5, 'rgba(126,90,56,0.6)', 'center', 600);
-};
-
-DailyOverlay.prototype.renderTasks = function (ctx) {
-  var x = this.x + 14;
-  var y = this.contentY;
-  var contentW = this.w - 28;
-
-  for (var i = 0; i < this.quests.length; i++) {
-    var q = this.quests[i];
-    var ry = y + i * (this.rowH + this.rowGap);
-    UI.fillRR(ctx, x, ry, contentW, this.rowH, 13, 'rgba(126,90,56,0.06)');
-    UI.text(ctx, q.text, x + 12, ry + 17, 12, T.ink, 'left', 800);
-    UI.text(ctx, q.progress + '/' + q.target, x + contentW - 84, ry + 17, 10, T.inkSoft, 'right', 700);
-    UI.bar(ctx, x + 12, ry + this.rowH - 16, contentW - 108, 5, q.progress / q.target, T.green, 'rgba(126,90,56,0.14)', 2.5);
-
-    var b = null;
-    for (var k = 0; k < this.buttons.length; k++) {
-      if (this.buttons[k].action === 'quest:' + q.id) { b = this.buttons[k]; break; }
-    }
-    if (b) {
-      var label = q.claimed ? '已领取' : (q.canClaim ? '+' + q.reward : '进行中');
-      var btn = UI.makeButton({
-        x: b.x, y: b.y, w: b.w, h: b.h, radius: 10, label: label,
-        kind: q.canClaim ? 'gold' : 'secondary', size: 10, enabled: q.canClaim
-      });
-      btn.pressed = b.pressed;
-      UI.button(ctx, btn);
-    }
-  }
-};
-
-DailyOverlay.prototype.update = function (dt) {
-  this.t += dt;
-};
-
-DailyOverlay.prototype.onDown = function (p) {
-  this.active = null;
-  if (UI.hit(this.closeBtn, p.x, p.y)) { this.active = this.closeBtn; return; }
-  for (var i = 0; i < this.tabs.length; i++) {
-    if (UI.hit(this.tabs[i], p.x, p.y)) { this.active = this.tabs[i]; Sound.tap(); return; }
-  }
-  for (var j = 0; j < this.buttons.length; j++) {
-    var b = this.buttons[j];
-    if (UI.hit(b, p.x, p.y)) {
-      if (b.enabled === false) return;
-      this.active = b;
-      b.pressed = true;
-      Sound.tap();
-      return;
-    }
-  }
-};
-
-DailyOverlay.prototype.onUp = function (p) {
-  var a = this.active;
-  this.active = null;
-  if (a && a.pressed !== undefined) a.pressed = false;
-  if (!a || !UI.hit(a, p.x, p.y)) return;
-
-  if (a === this.closeBtn) {
-    this.closed = true;
-    if (this.onClose) this.onClose();
-    return;
-  }
-  if (a.mode) {
-    this.mode = a.mode;
-    this.layout();
-    return;
-  }
-  if (a.action === 'dailyClaim') {
-    var r = Economy.claimDaily();
-    if (r.ok) {
-      Sound.coin();
-      this.main.notify('第 ' + r.day + ' 天补给 +' + r.reward + ' 土豆币');
-      this.refresh();
-    }
-  } else if (a.action === 'dailyDouble') {
-    var self = this;
-    this.main.rewarded('daily_double', function () {
-      var rr = Economy.doubleDaily();
-      if (rr.ok) {
-        Sound.coin();
-        self.main.notify('每日补给翻倍 +' + rr.reward);
-        self.refresh();
-      }
-    });
-  } else if (a.action && a.action.indexOf('quest:') === 0) {
-    var res = Economy.claimQuest(a.action.slice(6));
-    if (res.ok) {
-      Sound.coin();
-      this.main.notify('任务完成 +' + res.reward + ' 土豆币');
-      this.refresh();
-    }
-  }
-};
-
-module.exports = DailyOverlay;
-
-};
-__defs["scenes/settings"] = function(module, exports, require){
-/**
- * 设置与关于。
- */
-var CONFIG = require('../config');
-var Platform = require('../platform');
-var Economy = require('../economy');
-var Sound = require('../audio');
-var UI = require('../ui');
-var T = UI.T;
-
-function SettingsOverlay(main, onClose) {
-  this.main = main;
-  this.onClose = onClose;
-  this.closed = false;
-  this.active = null;
-  this.resetArmed = false;
-  this.armT = 0;
-  this.layout();
-}
-
-SettingsOverlay.prototype.layout = function () {
-  var W = this.main.W;
-  var H = this.main.H;
-  this.W = W;
-  this.H = H;
-  this.w = Math.min(W - 36, 340);
-  this.h = 400;
-  this.x = (W - this.w) / 2;
-  this.y = (H - this.h) / 2;
-  this.build();
-};
-
-SettingsOverlay.prototype.build = function () {
-  var x = this.x;
-  var y = this.y;
-  var w = this.w;
-  this.rows = [
-    { x: x + 16, y: y + 74, w: w - 32, h: 52, action: 'sound' },
-    { x: x + 16, y: y + 132, w: w - 32, h: 52, action: 'haptic' }
-  ];
-  this.closeBtn = { x: x + w - 46, y: y + 12, w: 36, h: 36 };
-  this.shareBtn = { x: x + 16, y: y + 218, w: w - 32, h: 46, action: 'share', pressed: false };
-  this.resetBtn = { x: x + 16, y: y + 274, w: w - 32, h: 40, action: 'reset', pressed: false };
-};
-
-SettingsOverlay.prototype.render = function (ctx) {
-  UI.dim(ctx, this.W, this.H, 0.6);
-  var x = this.x;
-  var y = this.y;
-  var w = this.w;
-  ctx.save();
-  UI.shadow(ctx, 'rgba(0,0,0,0.35)', 26, 0, 10);
-  UI.fillRR(ctx, x, y, w, this.h, 22, '#FFF8E8');
-  UI.clearShadow(ctx);
-
-  UI.text(ctx, '设置', x + 20, y + 30, 21, T.ink, 'left', 900);
-  UI.fillRR(ctx, this.closeBtn.x, this.closeBtn.y, 36, 36, 12, 'rgba(126,90,56,0.09)');
-  UI.drawIcon(ctx, 'close', this.closeBtn.x + 18, this.closeBtn.y + 18, 17, T.inkSoft);
-
-  // 音效 / 震动
-  this.drawToggleRow(ctx, this.rows[0], '音效', Economy.s.settings.sound, 'sound', true);
-  this.drawToggleRow(ctx, this.rows[1], '震动反馈', Economy.s.settings.haptics, 'hand', false);
-
-  var sb = UI.makeButton({
-    x: this.shareBtn.x, y: this.shareBtn.y, w: this.shareBtn.w, h: this.shareBtn.h,
-    radius: 14, label: '分享给工友', kind: 'primary', size: 14, icon: 'share'
-  });
-  sb.pressed = this.shareBtn.pressed;
-  UI.button(ctx, sb);
-
-  var rb = UI.makeButton({
-    x: this.resetBtn.x, y: this.resetBtn.y, w: this.resetBtn.w, h: this.resetBtn.h,
-    radius: 12, label: this.resetArmed ? '再次点击确认清空存档' : '清空存档',
-    kind: 'secondary', size: 11.5
-  });
-  rb.pressed = this.resetBtn.pressed;
-  UI.button(ctx, rb);
-
-  UI.text(ctx, CONFIG.title + ' v' + CONFIG.version, x + w / 2, y + 336, 11, T.ink, 'center', 800);
-  UI.text(ctx, '灵感来自 Steam《Potato Please》', x + w / 2, y + 354, 9.5, T.inkSoft, 'center', 600);
-  UI.text(ctx, '广告由微信流量主提供 · 无内购', x + w / 2, y + 370, 9.5, T.inkSoft, 'center', 600);
-  ctx.restore();
-};
-
-SettingsOverlay.prototype.drawToggleRow = function (ctx, r, label, on, icon, isSound) {
-  UI.fillRR(ctx, r.x, r.y, r.w, r.h, 13, 'rgba(126,90,56,0.06)');
-  UI.drawIcon(ctx, icon, r.x + 26, r.y + r.h / 2, 20, T.ink);
-  UI.text(ctx, label, r.x + 48, r.y + r.h / 2, 13, T.ink, 'left', 800);
-  var sw = 48;
-  var sh = 28;
-  var sx = r.x + r.w - 14 - sw;
-  var sy = r.y + (r.h - sh) / 2;
-  UI.fillRR(ctx, sx, sy, sw, sh, sh / 2, on ? T.green : 'rgba(126,90,56,0.22)');
-  ctx.beginPath();
-  ctx.arc(sx + (on ? sw - sh / 2 : sh / 2), sy + sh / 2, sh / 2 - 3, 0, Math.PI * 2);
-  ctx.fillStyle = '#FFFDF4';
-  ctx.fill();
-};
-
-SettingsOverlay.prototype.update = function (dt) {
-  if (this.resetArmed) {
-    this.armT -= dt;
-    if (this.armT <= 0) { this.resetArmed = false; }
-  }
-};
-
-SettingsOverlay.prototype.onDown = function (p) {
-  this.active = null;
-  if (UI.hit(this.closeBtn, p.x, p.y)) { this.active = this.closeBtn; return; }
-  for (var i = 0; i < this.rows.length; i++) {
-    if (UI.hit(this.rows[i], p.x, p.y)) { this.active = this.rows[i]; Sound.tap(); return; }
-  }
-  if (UI.hit(this.shareBtn, p.x, p.y)) { this.active = this.shareBtn; this.shareBtn.pressed = true; Sound.tap(); return; }
-  if (UI.hit(this.resetBtn, p.x, p.y)) { this.active = this.resetBtn; this.resetBtn.pressed = true; Sound.tap(); }
-};
-
-SettingsOverlay.prototype.onUp = function (p) {
-  var a = this.active;
-  this.active = null;
-  if (this.shareBtn) this.shareBtn.pressed = false;
-  if (this.resetBtn) this.resetBtn.pressed = false;
-  if (!a || !UI.hit(a, p.x, p.y)) return;
-
-  if (a === this.closeBtn) {
-    this.closed = true;
-    if (this.onClose) this.onClose();
-  } else if (a.action === 'sound') {
-    var on = !Economy.s.settings.sound;
-    Economy.setSetting('sound', on);
-    Sound.setMuted(!on);
-    if (on) Sound.tap();
-  } else if (a.action === 'haptic') {
-    var h = !Economy.s.settings.haptics;
-    Economy.setSetting('haptics', h);
-    if (h) Platform.haptic('medium');
-  } else if (a.action === 'share') {
-    this.main.shareGame();
-  } else if (a.action === 'reset') {
-    if (!this.resetArmed) {
-      this.resetArmed = true;
-      this.armT = 3;
-      this.main.notify('再次点击“清空存档”以确认');
-    } else {
-      Economy.resetAll();
-      Sound.setMuted(!Economy.s.settings.sound);
-      this.main.notify('存档已清空');
-      this.closed = true;
-      if (this.onClose) this.onClose();
-    }
-  }
-};
-
-module.exports = SettingsOverlay;
-
-};
-__defs["scenes/play"] = function(module, exports, require){
-/**
- * 削皮玩法：滑动擦除土豆皮，控制浪费，限时交单。
- */
-var CONFIG = require('../config');
-var Platform = require('../platform');
-var Economy = require('../economy');
-var Ads = require('../ads');
-var Sound = require('../audio');
-var UI = require('../ui');
-var T = UI.T;
-var Potato = require('../potato');
-var FX = require('../fx');
-
-function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-function fmtTime(s) {
-  s = Math.max(0, Math.ceil(s));
-  var m = Math.floor(s / 60);
-  var ss = s % 60;
-  return m + ':' + (ss < 10 ? '0' : '') + ss;
-}
-function easeOutBack(x) {
-  var c1 = 1.70158;
-  var c3 = c1 + 1;
-  return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
-}
-
-function PlayScene(main) {
-  this.main = main;
-  this.order = Economy.nextOrder();
-  this.effects = Economy.effects();
-  this.results = [];
-  this.index = 0;
-  this.timeLeft = this.order.timeLimit;
-  this.timerStarted = false;
-  this.t = 0;
-  this.fx = new FX();
-  this.dragging = false;
-  this.pressedAction = null;
-  this.overlayT = 0;
-  this.serveT = 0;
-  this.leaving = false;
-  this.revived = false;
-  this.doubled = false;
-  this.summary = null;
-  this.targetCoins = 0;
-  this.coinShown = 0;
-  this.wasteFlash = 0;
-  this.peelHapticT = 0;
-  this.wasteTextT = 0;
-  this.targetNotified = false;
-  this.hintT = 0;
-  this.lastPoint = null;
-  this.tutorial = !Economy.s.tutorialDone;
-  this.state = this.tutorial ? 'tutorial' : 'play';
-  this.layout();
-  this.spawnPotato(0);
-  this.state = this.tutorial ? 'tutorial' : 'play';
-}
-
-PlayScene.prototype.enter = function () {
-  Ads.hideBanner();
-};
-
-PlayScene.prototype.onHide = function () {
-  if (this.state === 'play') this.openPause();
-  Economy.save();
-};
-
-PlayScene.prototype.layout = function () {
-  var W = this.main.W;
-  var H = this.main.H;
-  var st = Platform.safeTop;
-  var sb = Platform.safeBottom;
-  this.W = W;
-  this.H = H;
-  this.safeTop = st;
-  this.safeBottom = sb;
-  this.R = Math.min(W * 0.31, H * 0.16, 132);
-  this.cx = W / 2;
-  this.cy = st + H * 0.42;
-  this.boardY = this.cy + this.R * 0.92;
-
-  this.progressW = Math.min(W - 32, 322);
-  this.progressH = 66;
-  this.progressX = (W - this.progressW) / 2;
-  this.progressY = this.boardY + this.R * 0.34 + 10;
-
-  this.pauseBtn = { x: 16, y: st + 10, w: 42, h: 42 };
-  this.completeBtn = { x: (W - 200) / 2, y: H - sb - 100, w: 200, h: 52 };
-
-  // 结果卡
-  var rw = Math.min(W - 36, 344);
-  var rh = Math.min(480, H - 56);
-  this.resultCard = { x: (W - rw) / 2, y: (H - rh) / 2, w: rw, h: rh };
-  this.resultDoubleBtn = { x: this.resultCard.x + 20, y: this.resultCard.y + 318, w: rw - 40, h: 44, action: 'double', pressed: false };
-  this.resultNextBtn = { x: this.resultCard.x + 20, y: this.resultCard.y + 370, w: rw - 40, h: 48, action: 'next', pressed: false };
-  this.resultHomeBtn = { x: this.resultCard.x + 20, y: this.resultCard.y + 426, w: rw - 40, h: 38, action: 'home', pressed: false };
-
-  // 暂停卡
-  var pw = Math.min(W - 44, 320);
-  var ph = 316;
-  this.pauseCard = { x: (W - pw) / 2, y: (H - ph) / 2, w: pw, h: ph };
-  this.pauseResumeBtn = { x: this.pauseCard.x + 24, y: this.pauseCard.y + 138, w: pw - 48, h: 48, action: 'resume', pressed: false };
-  this.pauseRestartBtn = { x: this.pauseCard.x + 24, y: this.pauseCard.y + 196, w: pw - 48, h: 44, action: 'restart', pressed: false };
-  this.pauseHomeBtn = { x: this.pauseCard.x + 24, y: this.pauseCard.y + 250, w: pw - 48, h: 40, action: 'home', pressed: false };
-
-  // 失败卡
-  var fw = Math.min(W - 44, 330);
-  var fh = 336;
-  this.failCard = { x: (W - fw) / 2, y: (H - fh) / 2, w: fw, h: fh };
-  this.failReviveBtn = { x: this.failCard.x + 24, y: this.failCard.y + 164, w: fw - 48, h: 46, action: 'revive', pressed: false };
-  this.failRestartBtn = { x: this.failCard.x + 24, y: this.failCard.y + 218, w: fw - 48, h: 44, action: 'restart', pressed: false };
-  this.failHomeBtn = { x: this.failCard.x + 24, y: this.failCard.y + 272, w: fw - 48, h: 38, action: 'home', pressed: false };
-
-  // 教学卡
-  var tw = Math.min(W - 44, 330);
-  var th = 336;
-  this.tutorialCard = { x: (W - tw) / 2, y: (H - th) / 2, w: tw, h: th };
-  this.tutorialBtn = { x: this.tutorialCard.x + 24, y: this.tutorialCard.y + th - 70, w: tw - 48, h: 46, action: 'tutorialStart', pressed: false };
-};
-
-PlayScene.prototype.spawnPotato = function (i) {
-  if (this.potato) this.potato.dispose();
-  var golden = this.order.goldenIndex === i;
-  var target = golden ? CONFIG.order.goldenPeel : this.order.target;
-  var seed = (Platform.now() + i * 7919 + this.order.index * 104729) >>> 0;
-  this.potato = new Potato({
-    cx: this.cx,
-    cy: this.cy,
-    R: this.R * (0.97 + (i % 3) * 0.015),
-    dpr: this.main.dpr,
-    golden: golden,
-    target: target,
-    brush: this.effects.brush,
-    wasteDepth: this.effects.wasteDepth,
-    seed: seed
-  });
-  this.currentGolden = golden;
-  this.currentTarget = target;
-  this.targetNotified = false;
-  this.serveT = 0;
-  this.dragging = false;
-  this.lastPoint = null;
-};
-
-PlayScene.prototype.onDown = function (p) {
-  if (this.leaving) return;
-  var st = this.state;
-
-  if (st === 'tutorial') {
-    if (UI.hit(this.tutorialBtn, p.x, p.y)) this.pressedAction = 'tutorialStart';
-    return;
-  }
-  if (st === 'paused') {
-    if (UI.hit(this.pauseResumeBtn, p.x, p.y)) this.pressedAction = 'resume';
-    else if (UI.hit(this.pauseRestartBtn, p.x, p.y)) this.pressedAction = 'restart';
-    else if (UI.hit(this.pauseHomeBtn, p.x, p.y)) this.pressedAction = 'home';
-    if (this.pressedAction) Sound.tap();
-    return;
-  }
-  if (st === 'result') {
-    if (UI.hit(this.resultDoubleBtn, p.x, p.y)) this.pressedAction = 'double';
-    else if (UI.hit(this.resultNextBtn, p.x, p.y)) this.pressedAction = 'next';
-    else if (UI.hit(this.resultHomeBtn, p.x, p.y)) this.pressedAction = 'home';
-    if (this.pressedAction) Sound.tap();
-    return;
-  }
-  if (st === 'fail') {
-    if (UI.hit(this.failReviveBtn, p.x, p.y)) this.pressedAction = 'revive';
-    else if (UI.hit(this.failRestartBtn, p.x, p.y)) this.pressedAction = 'restart';
-    else if (UI.hit(this.failHomeBtn, p.x, p.y)) this.pressedAction = 'home';
-    if (this.pressedAction) Sound.tap();
-    return;
-  }
-  if (st !== 'play') return;
-
-  if (UI.hit(this.pauseBtn, p.x, p.y)) { this.pressedAction = 'pause'; Sound.tap(); return; }
-  if (this.canComplete() && UI.hit(this.completeBtn, p.x, p.y)) {
-    this.pressedAction = 'complete';
-    Sound.tap();
-    return;
-  }
-
-  this.dragging = true;
-  this.lastPoint = { x: p.x, y: p.y };
-  this.potato.beginStroke(p.x, p.y);
-  if (!this.timerStarted) {
-    this.timerStarted = true;
-    Platform.reportEvent('order_start_peel', { order: this.order.index });
-  }
-  this.hintT = 99;
-};
-
-PlayScene.prototype.onMove = function (p) {
-  if (this.state !== 'play' || !this.dragging || !this.lastPoint) return;
-  var dx = p.x - this.lastPoint.x;
-  var dy = p.y - this.lastPoint.y;
-  var res = this.potato.peelTo(p.x, p.y);
-  if (res.removed > 0) {
-    Sound.peel();
-    if (this.peelHapticT <= 0) {
-      Platform.haptic('light');
-      this.peelHapticT = 0.11;
-    }
-    this.fx.peelBurst(p.x, p.y, dx, dy, this.currentGolden ? 2 : 2, this.currentGolden);
-  }
-  if (res.wasteAdded > 0) {
-    this.wasteFlash = Math.min(0.5, this.wasteFlash + 0.16);
-    if (this.wasteTextT <= 0) {
-      this.fx.floatText(p.x, p.y - 26, '浪费!', T.red, 14);
-      this.wasteTextT = 0.8;
-    }
-    Platform.haptic('medium');
-  }
-  this.lastPoint = { x: p.x, y: p.y };
-
-  if (!this.targetNotified && this.potato.progress() >= this.potato.target) {
-    this.targetNotified = true;
-    Sound.star();
-    Platform.haptic('medium');
-    this.main.notify('削净达标，可以交差了');
-  }
-};
-
-PlayScene.prototype.onUp = function (p) {
-  if (this.leaving) return;
-  var st = this.state;
-  var a = this.pressedAction;
-  this.pressedAction = null;
-
-  if (st === 'tutorial') {
-    if (a === 'tutorialStart' && UI.hit(this.tutorialBtn, p.x, p.y)) this.startTutorial();
-    return;
-  }
-  if (st === 'paused') {
-    if (a === 'resume' && UI.hit(this.pauseResumeBtn, p.x, p.y)) { this.state = 'play'; Sound.tap(); }
-    else if (a === 'restart' && UI.hit(this.pauseRestartBtn, p.x, p.y)) this.restartOrder();
-    else if (a === 'home' && UI.hit(this.pauseHomeBtn, p.x, p.y)) this.main.toMenu();
-    return;
-  }
-  if (st === 'result') {
-    if (a === 'double' && UI.hit(this.resultDoubleBtn, p.x, p.y)) this.doubleResult();
-    else if (a === 'next' && UI.hit(this.resultNextBtn, p.x, p.y)) this.leaveTo('next');
-    else if (a === 'home' && UI.hit(this.resultHomeBtn, p.x, p.y)) this.leaveTo('home');
-    return;
-  }
-  if (st === 'fail') {
-    if (a === 'revive' && UI.hit(this.failReviveBtn, p.x, p.y)) this.revive();
-    else if (a === 'restart' && UI.hit(this.failRestartBtn, p.x, p.y)) this.restartOrder();
-    else if (a === 'home' && UI.hit(this.failHomeBtn, p.x, p.y)) this.main.toMenu();
-    return;
-  }
-  if (st !== 'play') return;
-
-  if (a === 'pause' && UI.hit(this.pauseBtn, p.x, p.y)) { this.openPause(); return; }
-  if (a === 'complete' && UI.hit(this.completeBtn, p.x, p.y)) { this.finishPotato(); return; }
-  if (this.dragging) {
-    this.potato.endStroke();
-    this.dragging = false;
-  }
-};
-
-PlayScene.prototype.startTutorial = function () {
-  this.tutorial = false;
-  this.state = 'play';
-  Economy.markTutorialDone();
-  Sound.tap();
-};
-
-PlayScene.prototype.openPause = function () {
-  if (this.state !== 'play') return;
-  this.state = 'paused';
-  this.dragging = false;
-  this.pressedAction = null;
-  this.overlayT = 0;
-};
-
-PlayScene.prototype.restartOrder = function () {
-  if (this.leaving) return;
-  this.leaving = true;
-  this.main.startOrder();
-};
-
-PlayScene.prototype.canComplete = function () {
-  return this.state === 'play' && this.potato && this.potato.progress() >= this.potato.target;
-};
-
-PlayScene.prototype.finishPotato = function () {
-  if (!this.canComplete()) return;
-  var waste = this.potato.waste();
-  var peel = this.potato.progress();
-  var grade = Economy.gradeForWaste(waste);
-  this.results.push({ waste: waste, peel: peel, grade: grade, golden: this.currentGolden });
-  this.state = 'serving';
-  this.serveT = 0;
-  this.dragging = false;
-  this.potato.endStroke();
-  this.potato.completed = true;
-
-  Sound.complete();
-  Platform.haptic('heavy');
-  this.fx.sparkle(this.cx, this.cy, 18, this.currentGolden ? '#FFE28A' : '#F2B84B', 60);
-  this.fx.floatText(this.cx, this.cy - this.R * 0.4, grade.key + ' · ' + grade.name, grade.color, 24);
-};
-
-PlayScene.prototype.completeOrder = function () {
-  this.summary = Economy.finishOrder(this.order, this.results);
-  this.state = 'result';
-  this.overlayT = 0;
-  this.main.toast.life = 0;
-  this.coinShown = 0;
-  this.targetCoins = this.summary.coins;
-  this.doubled = false;
-  this.dragging = false;
-  Sound.star();
-  Platform.haptic('heavy');
-  Platform.reportEvent('result_show', { order: this.order.index, grade: this.summary.grade.key });
-};
-
-PlayScene.prototype.doubleResult = function () {
-  if (this.doubled || !this.summary) return;
-  var self = this;
-  this.main.rewarded('result_double', function () {
-    Economy.addCoins(self.summary.coins);
-    self.doubled = true;
-    self.targetCoins = self.summary.coins * 2;
-    Sound.coin();
-    self.main.notify('结算金币翻倍 +' + self.summary.coins);
-  });
-};
-
-PlayScene.prototype.leaveTo = function (where) {
-  if (this.leaving) return;
-  this.leaving = true;
-  var main = this.main;
-  if (this.potato) this.potato.dispose();
-  main.maybeInterstitial(function () {
-    if (where === 'next') main.startOrder();
-    else main.toMenu();
-  });
-};
-
-PlayScene.prototype.fail = function () {
-  if (this.state !== 'play') return;
-  this.state = 'fail';
-  this.overlayT = 0;
-  this.dragging = false;
-  this.timerStarted = false;
-  Sound.fail();
-  Platform.haptic('heavy');
-  Economy.failOrder(this.order);
-};
-
-PlayScene.prototype.revive = function () {
-  if (this.revived) { this.main.notify('本单已经加过时了'); return; }
-  var self = this;
-  this.main.rewarded('fail_revive', function () {
-    self.revived = true;
-    self.timeLeft += 15;
-    self.state = 'play';
-    self.timerStarted = true;
-    self.main.notify('加时 15 秒，继续削！');
-  });
-};
-
-PlayScene.prototype.update = function (dt) {
-  this.t += dt;
-  if (this.potato) {
-    if (this.potato.introT < 1) this.potato.introT = Math.min(1, this.potato.introT + dt * 3.4);
-    if (this.state === 'serving') {
-      this.potato.goneT = Math.min(1, this.potato.goneT + dt * 2.6);
-    }
-  }
-  this.fx.update(dt);
-  if (this.wasteFlash > 0) this.wasteFlash = Math.max(0, this.wasteFlash - dt * 1.6);
-  if (this.peelHapticT > 0) this.peelHapticT -= dt;
-  if (this.wasteTextT > 0) this.wasteTextT -= dt;
-  if (this.hintT < 99) this.hintT += dt;
-
-  if (this.state === 'play' && this.timerStarted) {
-    this.timeLeft -= dt;
-    if (this.timeLeft <= 0) {
-      this.timeLeft = 0;
-      this.fail();
-    }
-  }
-
-  if (this.state === 'serving') {
-    this.serveT += dt;
-    if (this.serveT >= 0.62) {
-      if (this.index + 1 < this.order.count) {
-        this.index += 1;
-        this.spawnPotato(this.index);
-        this.state = 'play';
-      } else {
-        this.completeOrder();
-      }
-    }
-  }
-
-  if (this.state === 'result') {
-    this.overlayT = Math.min(1, this.overlayT + dt * 4);
-    var target = this.targetCoins || 0;
-    this.coinShown += (target - this.coinShown) * Math.min(1, dt * 6);
-    if (Math.abs(target - this.coinShown) < 0.6) this.coinShown = target;
-  } else if (this.state === 'fail' || this.state === 'paused' || this.state === 'tutorial') {
-    this.overlayT = Math.min(1, this.overlayT + dt * 5);
-  }
-};
-
-PlayScene.prototype.render = function (ctx) {
-  this.drawBackground(ctx);
-  this.drawBoard(ctx);
-  if (this.potato) this.potato.render(ctx, this.t);
-  this.fx.render(ctx);
-  this.drawHUD(ctx);
-  this.drawProgress(ctx);
-  this.drawHint(ctx);
-  this.drawCompleteButton(ctx);
-
-  if (this.state === 'tutorial') this.drawTutorial(ctx);
-  else if (this.state === 'paused') this.drawPause(ctx);
-  else if (this.state === 'fail') this.drawFail(ctx);
-  else if (this.state === 'result') this.drawResult(ctx);
-
-  if (this.wasteFlash > 0) {
-    ctx.fillStyle = 'rgba(217,105,79,' + (this.wasteFlash * 0.16) + ')';
-    ctx.fillRect(0, 0, this.W, this.H);
-  }
-};
-
-PlayScene.prototype.drawBackground = function (ctx) {
-  var W = this.W;
-  var H = this.H;
-  var wallH = H * 0.66;
-
-  var bg = ctx.createLinearGradient(0, 0, 0, H);
-  bg.addColorStop(0, '#F8E9C8');
-  bg.addColorStop(0.6, '#EFDAB2');
-  bg.addColorStop(1, '#D8B983');
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, W, H);
-
-  ctx.save();
-  ctx.globalAlpha = 0.42;
-  ctx.strokeStyle = '#E0C69A';
-  ctx.lineWidth = 1;
-  var tile = Math.max(40, W / 9);
-  for (var x = 0; x < W; x += tile) {
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, wallH); ctx.stroke();
-  }
-  for (var y = 0; y < wallH; y += tile) {
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-  }
-  ctx.restore();
-
-  // 顶灯光锥
-  var lg = ctx.createRadialGradient(this.cx, this.safeTop + 20, 8, this.cx, this.cy, this.R * 2.4);
-  lg.addColorStop(0, 'rgba(255,248,220,0.6)');
-  lg.addColorStop(1, 'rgba(255,248,220,0)');
-  ctx.fillStyle = lg;
-  ctx.fillRect(0, 0, W, H);
-
-  // 台面
-  var cg = ctx.createLinearGradient(0, wallH, 0, H);
-  cg.addColorStop(0, '#C99159');
-  cg.addColorStop(0.1, '#B57C46');
-  cg.addColorStop(1, '#8A5629');
-  ctx.fillStyle = cg;
-  ctx.fillRect(0, wallH, W, H - wallH);
-  ctx.fillStyle = 'rgba(255,236,200,0.28)';
-  ctx.fillRect(0, wallH, W, 2);
-
-  // 木纹
-  ctx.save();
-  ctx.globalAlpha = 0.12;
-  ctx.strokeStyle = '#5E3A18';
-  ctx.lineWidth = 1.2;
-  for (var i = 0; i < 6; i++) {
-    var yy = wallH + 30 + i * 40;
-    ctx.beginPath();
-    ctx.moveTo(0, yy);
-    ctx.bezierCurveTo(W * 0.3, yy - 5, W * 0.65, yy + 6, W, yy - 2);
-    ctx.stroke();
-  }
-  ctx.restore();
-
-  // 墙上的配额牌
-  var sx = W - 92;
-  var sy = this.safeTop + 78;
-  ctx.save();
-  ctx.globalAlpha = 0.6;
-  UI.fillRR(ctx, sx, sy, 74, 50, 8, '#F6E3BC');
-  UI.strokeRR(ctx, sx, sy, 74, 50, 8, 'rgba(126,90,56,0.45)', 1.4);
-  UI.text(ctx, '今日配额', sx + 37, sy + 15, 8, T.inkSoft, 'center', 700);
-  UI.text(ctx, this.order.count + ' 颗', sx + 37, sy + 32, 14, T.ink, 'center', 900);
-  ctx.restore();
-
-  // 小桶
-  var bx = W - 52;
-  var by = this.boardY + this.R * 0.32;
-  ctx.save();
-  ctx.beginPath();
-  ctx.moveTo(bx - 20, by - 20);
-  ctx.lineTo(bx + 20, by - 20);
-  ctx.lineTo(bx + 15, by + 22);
-  ctx.lineTo(bx - 15, by + 22);
-  ctx.closePath();
-  ctx.fillStyle = 'rgba(120,78,34,0.75)';
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(70,40,15,0.4)';
-  ctx.lineWidth = 1.4;
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.arc(bx, by - 20, 20, Math.PI, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(70,40,15,0.35)';
-  ctx.stroke();
-  for (var k = 0; k < this.results.length; k++) {
-    ctx.beginPath();
-    ctx.ellipse ? ctx.ellipse(bx - 8 + (k % 3) * 8, by - 18 + (k % 2) * 4, 7, 5, 0.2, 0, Math.PI * 2) :
-      ctx.arc(bx - 8 + (k % 3) * 8, by - 18, 5, 0, Math.PI * 2);
-    ctx.fillStyle = '#F8E6B4';
-    ctx.fill();
-  }
-  UI.text(ctx, '已入桶 ' + this.results.length, bx, by + 34, 8.5, 'rgba(255,244,214,0.85)', 'center', 700);
-  ctx.restore();
-};
-
-PlayScene.prototype.drawBoard = function (ctx) {
-  var cx = this.cx;
-  var by = this.boardY;
-  var rx = this.R * 1.48;
-  var ry = this.R * 0.48;
-
-  ctx.save();
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(cx, by + 8, rx * 1.02, ry * 0.95, 0, 0, Math.PI * 2) :
-    ctx.arc(cx, by + 8, rx * 0.7, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(60,34,12,0.22)';
-  ctx.fill();
-
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(cx, by, rx, ry, 0, 0, Math.PI * 2) : ctx.arc(cx, by, rx * 0.7, 0, Math.PI * 2);
-  var g = ctx.createLinearGradient(cx - rx, by - ry, cx + rx, by + ry);
-  g.addColorStop(0, '#D6A067');
-  g.addColorStop(0.5, '#C08A50');
-  g.addColorStop(1, '#9A6738');
-  ctx.fillStyle = g;
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(90,52,20,0.35)';
-  ctx.lineWidth = 2;
-  ctx.stroke();
-
-  // 年轮
-  ctx.save();
-  ctx.globalAlpha = 0.18;
-  ctx.strokeStyle = '#6E4520';
-  ctx.lineWidth = 1;
-  for (var i = 1; i <= 3; i++) {
-    ctx.beginPath();
-    ctx.ellipse ? ctx.ellipse(cx, by, rx * (0.25 + i * 0.18), ry * (0.25 + i * 0.18), 0, 0, Math.PI * 2) :
-      ctx.arc(cx, by, rx * 0.4, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-  ctx.restore();
-  ctx.restore();
-};
-
-PlayScene.prototype.drawHUD = function (ctx) {
-  var W = this.W;
-  var st = this.safeTop;
-
-  // 暂停
-  UI.button(ctx, UI.makeButton({
-    x: this.pauseBtn.x, y: this.pauseBtn.y, w: 42, h: 42, kind: 'icon', radius: 13,
-    icon: 'pause', iconSize: 17
-  }));
-
-  // 订单
-  var ow = 136;
-  var ox = (W - ow) / 2;
-  UI.pill(ctx, ox, st + 12, ow, 38, 'rgba(255,248,232,0.94)', 'rgba(150,103,52,0.28)');
-  UI.text(ctx, '第 ' + this.order.index + ' 单 · ' + (this.index + 1) + '/' + this.order.count, ox + ow / 2, st + 31, 13, T.ink, 'center', 800);
-
-  // 计时
-  var tw = 88;
-  var tx = W - 16 - tw;
-  var low = this.timeLeft <= 15;
-  UI.pill(ctx, tx, st + 12, tw, 38, low ? 'rgba(217,105,79,0.16)' : 'rgba(255,248,232,0.94)', low ? 'rgba(217,105,79,0.55)' : 'rgba(150,103,52,0.28)');
-  UI.drawIcon(ctx, 'clock', tx + 18, st + 31, 15, low ? T.red : T.inkSoft);
-  UI.text(ctx, fmtTime(this.timeLeft), tx + tw - 12, st + 31, 15, low ? T.red : T.ink, 'right', 800);
-
-  // 金土豆
-  if (this.currentGolden) {
-    var gw = 146;
-    var gx = (W - gw) / 2;
-    var gy = st + 58;
-    UI.pill(ctx, gx, gy, gw, 24, 'rgba(242,184,75,0.9)');
-    UI.text(ctx, '金土豆 · 需削净 95%', gx + gw / 2, gy + 12, 10, '#5E3A12', 'center', 800);
-  }
-};
-
-PlayScene.prototype.drawProgress = function (ctx) {
-  var x = this.progressX;
-  var y = this.progressY;
-  var w = this.progressW;
-  var h = this.progressH;
-  var p = this.potato ? this.potato.progress() : 0;
-  var target = this.currentTarget || this.order.target;
-  var waste = this.potato ? this.potato.waste() : 0;
-  var done = p >= target;
-
-  UI.fillRR(ctx, x, y, w, h, 16, 'rgba(255,248,232,0.95)');
-  UI.strokeRR(ctx, x, y, w, h, 16, done ? 'rgba(242,184,75,0.85)' : 'rgba(150,103,52,0.24)', done ? 2 : 1.2);
-
-  UI.text(ctx, '削净', x + 16, y + 15, 10, T.inkSoft, 'left', 700);
-  UI.text(ctx, Math.round(p * 100) + '%', x + 16, y + 34, 19, done ? T.greenDark : T.ink, 'left', 900);
-  UI.text(ctx, '目标 ' + Math.round(target * 100) + '%' + (done ? ' · 已达标' : ''), x + 82, y + 35, 9,
-    done ? T.greenDark : T.inkSoft, 'left', done ? 800 : 600);
-
-  UI.text(ctx, '浪费', x + w - 16, y + 15, 10, T.inkSoft, 'right', 700);
-  UI.text(ctx, (waste * 100).toFixed(1) + '%', x + w - 16, y + 34, 16, waste > 0.04 ? T.red : T.ink, 'right', 900);
-
-  UI.bar(ctx, x + 16, y + 51, w - 32, 6, p, done ? T.gold : T.green, 'rgba(126,90,56,0.14)', 3);
-  var tx = x + 16 + (w - 32) * target;
-  ctx.beginPath();
-  ctx.moveTo(tx, y + 48);
-  ctx.lineTo(tx, y + 60);
-  ctx.strokeStyle = 'rgba(94,58,28,0.75)';
-  ctx.lineWidth = 2;
-  ctx.stroke();
-};
-
-PlayScene.prototype.drawHint = function (ctx) {
-  var W = this.W;
-  var y = this.progressY + this.progressH + 20;
-  if (this.hintT > 4.2 && this.timerStarted) return;
-  var text = this.timerStarted ? '别反复刮同一处，浪费会拉低评级' : '按住土豆，来回滑动开始削皮';
-  var w = UI.measure(ctx, text, 11, 700) + 44;
-  var x = (W - w) / 2;
-  ctx.save();
-  ctx.globalAlpha = this.timerStarted ? Math.max(0, 1 - (this.hintT - 2.4) / 1.8) : 0.9;
-  UI.pill(ctx, x, y, w, 30, 'rgba(255,248,232,0.72)');
-  UI.drawIcon(ctx, 'hand', x + 18, y + 15, 14, T.inkSoft);
-  UI.text(ctx, text, x + 30, y + 15, 11, T.inkSoft, 'left', 700);
-  ctx.restore();
-};
-
-PlayScene.prototype.drawCompleteButton = function (ctx) {
-  if (!this.canComplete()) return;
-  var b = UI.makeButton({
-    x: this.completeBtn.x, y: this.completeBtn.y, w: this.completeBtn.w, h: this.completeBtn.h,
-    radius: 16, label: '完成这颗', kind: 'primary', size: 18
-  });
-  b.pressed = this.pressedAction === 'complete';
-  var pulse = 1 + Math.sin(this.t * 4) * 0.015;
-  ctx.save();
-  ctx.translate(b.x + b.w / 2, b.y + b.h / 2);
-  ctx.scale(pulse, pulse);
-  ctx.translate(-(b.x + b.w / 2), -(b.y + b.h / 2));
-  UI.button(ctx, b);
-  ctx.restore();
-};
-
-PlayScene.prototype.drawTutorial = function (ctx) {
-  var c = this.tutorialCard;
-  var k = easeOutBack(this.overlayT);
-  UI.dim(ctx, this.W, this.H, 0.62);
-  ctx.save();
-  ctx.translate(c.x + c.w / 2, c.y + c.h / 2);
-  ctx.scale(0.9 + 0.1 * k, 0.9 + 0.1 * k);
-  ctx.translate(-(c.x + c.w / 2), -(c.y + c.h / 2));
-  UI.shadow(ctx, 'rgba(0,0,0,0.35)', 24, 0, 10);
-  UI.fillRR(ctx, c.x, c.y, c.w, c.h, 22, '#FFF8E8');
-  UI.clearShadow(ctx);
-
-  UI.text(ctx, '削土豆，先学三招', c.x + c.w / 2, c.y + 34, 20, T.ink, 'center', 900);
-
-  // 手势图示
-  var gx = c.x + c.w / 2;
-  var gy = c.y + 90;
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(gx, gy, 54, 34, 0, 0, Math.PI * 2) : ctx.arc(gx, gy, 42, 0, Math.PI * 2);
-  ctx.fillStyle = '#B0743E';
-  ctx.fill();
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(gx - 12, gy + 6, 22, 14, 0, 0, Math.PI * 2) : ctx.arc(gx - 12, gy + 6, 18, 0, Math.PI * 2);
-  ctx.fillStyle = '#F8E6B4';
-  ctx.fill();
-  var slide = Math.sin(this.t * 3) * 26;
-  UI.drawIcon(ctx, 'hand', gx + slide, gy - 38, 28, '#B98556');
-  ctx.beginPath();
-  ctx.moveTo(gx - 38, gy - 32);
-  ctx.lineTo(gx + 38, gy - 32);
-  ctx.strokeStyle = 'rgba(126,90,56,0.3)';
-  ctx.lineWidth = 2;
-  ctx.setLineDash ? ctx.setLineDash([5, 5]) : null;
-  ctx.stroke();
-  if (ctx.setLineDash) ctx.setLineDash([]);
-
-  var lines = [
-    '按住土豆，来回滑动削皮',
-    '别反复刮同一处，果肉会浪费',
-    '削净达到目标，点「完成这颗」'
-  ];
-  for (var i = 0; i < lines.length; i++) {
-    var ly = c.y + 150 + i * 32;
-    ctx.beginPath();
-    ctx.arc(c.x + 32, ly, 10, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(111,168,94,0.18)';
-    ctx.fill();
-    UI.text(ctx, String(i + 1), c.x + 32, ly, 10, T.greenDark, 'center', 800);
-    UI.text(ctx, lines[i], c.x + 50, ly, 12, T.ink, 'left', 700);
-  }
-
-  var b = UI.makeButton({
-    x: this.tutorialBtn.x, y: this.tutorialBtn.y, w: this.tutorialBtn.w, h: this.tutorialBtn.h,
-    radius: 15, label: '开始削皮', kind: 'primary', size: 16
-  });
-  b.pressed = this.pressedAction === 'tutorialStart';
-  UI.button(ctx, b);
-  UI.text(ctx, '第一次上岗不计时', c.x + c.w / 2, c.y + c.h - 10, 9, T.inkSoft, 'center', 600);
-  ctx.restore();
-};
-
-PlayScene.prototype.drawPause = function (ctx) {
-  var c = this.pauseCard;
-  var k = easeOutBack(this.overlayT);
-  UI.dim(ctx, this.W, this.H, 0.6);
-  ctx.save();
-  ctx.translate(c.x + c.w / 2, c.y + c.h / 2);
-  ctx.scale(0.92 + 0.08 * k, 0.92 + 0.08 * k);
-  ctx.translate(-(c.x + c.w / 2), -(c.y + c.h / 2));
-  UI.shadow(ctx, 'rgba(0,0,0,0.35)', 24, 0, 10);
-  UI.fillRR(ctx, c.x, c.y, c.w, c.h, 22, '#FFF8E8');
-  UI.clearShadow(ctx);
-
-  UI.text(ctx, '暂停', c.x + c.w / 2, c.y + 52, 24, T.ink, 'center', 900);
-  UI.text(ctx, '军需处也需要喘口气', c.x + c.w / 2, c.y + 86, 11, T.inkSoft, 'center', 600);
-  UI.text(ctx, '第 ' + this.order.index + ' 单 · ' + this.results.length + '/' + this.order.count + ' 颗已完成', c.x + c.w / 2, c.y + 110, 10, T.inkSoft, 'center', 600);
-
-  var b1 = UI.makeButton({ x: this.pauseResumeBtn.x, y: this.pauseResumeBtn.y, w: this.pauseResumeBtn.w, h: this.pauseResumeBtn.h, radius: 15, label: '继续削', kind: 'primary', size: 16 });
-  b1.pressed = this.pressedAction === 'resume';
-  UI.button(ctx, b1);
-  var b2 = UI.makeButton({ x: this.pauseRestartBtn.x, y: this.pauseRestartBtn.y, w: this.pauseRestartBtn.w, h: this.pauseRestartBtn.h, radius: 14, label: '重新开始本单', kind: 'secondary', size: 13 });
-  b2.pressed = this.pressedAction === 'restart';
-  UI.button(ctx, b2);
-  var b3 = UI.makeButton({ x: this.pauseHomeBtn.x, y: this.pauseHomeBtn.y, w: this.pauseHomeBtn.w, h: this.pauseHomeBtn.h, radius: 12, label: '回大厅', kind: 'secondary', size: 12 });
-  b3.pressed = this.pressedAction === 'home';
-  UI.button(ctx, b3);
-  ctx.restore();
-};
-
-PlayScene.prototype.drawFail = function (ctx) {
-  var c = this.failCard;
-  var k = easeOutBack(this.overlayT);
-  UI.dim(ctx, this.W, this.H, 0.62);
-  ctx.save();
-  ctx.translate(c.x + c.w / 2, c.y + c.h / 2);
-  ctx.scale(0.92 + 0.08 * k, 0.92 + 0.08 * k);
-  ctx.translate(-(c.x + c.w / 2), -(c.y + c.h / 2));
-  UI.shadow(ctx, 'rgba(0,0,0,0.4)', 24, 0, 10);
-  UI.fillRR(ctx, c.x, c.y, c.w, c.h, 22, '#FFF8E8');
-  UI.clearShadow(ctx);
-
-  ctx.beginPath();
-  ctx.arc(c.x + c.w / 2, c.y + 56, 28, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(217,105,79,0.14)';
-  ctx.fill();
-  UI.drawIcon(ctx, 'clock', c.x + c.w / 2, c.y + 56, 26, T.red);
-
-  UI.text(ctx, '时间到！', c.x + c.w / 2, c.y + 102, 22, T.ink, 'center', 900);
-  UI.text(ctx, '军需官盯着空桶，眉头皱了起来。', c.x + c.w / 2, c.y + 126, 10.5, T.inkSoft, 'center', 600);
-  UI.text(ctx, '已完成 ' + this.results.length + '/' + this.order.count + ' 颗', c.x + c.w / 2, c.y + 145, 12, T.ink, 'center', 800);
-
-  var b1 = UI.makeButton({
-    x: this.failReviveBtn.x, y: this.failReviveBtn.y, w: this.failReviveBtn.w, h: this.failReviveBtn.h,
-    radius: 14, label: this.revived ? '本单已加时' : '看视频 · 加时 15 秒',
-    kind: this.revived ? 'secondary' : 'gold', size: 14, enabled: !this.revived
-  });
-  b1.pressed = this.pressedAction === 'revive';
-  UI.button(ctx, b1);
-  var b2 = UI.makeButton({ x: this.failRestartBtn.x, y: this.failRestartBtn.y, w: this.failRestartBtn.w, h: this.failRestartBtn.h, radius: 14, label: '重新挑战', kind: 'primary', size: 14 });
-  b2.pressed = this.pressedAction === 'restart';
-  UI.button(ctx, b2);
-  var b3 = UI.makeButton({ x: this.failHomeBtn.x, y: this.failHomeBtn.y, w: this.failHomeBtn.w, h: this.failHomeBtn.h, radius: 12, label: '回大厅', kind: 'secondary', size: 12 });
-  b3.pressed = this.pressedAction === 'home';
-  UI.button(ctx, b3);
-  ctx.restore();
-};
-
-PlayScene.prototype.drawResult = function (ctx) {
-  var c = this.resultCard;
-  var k = easeOutBack(this.overlayT);
-  var s = this.summary;
-  if (!s) return;
-
-  UI.dim(ctx, this.W, this.H, 0.66);
-  ctx.save();
-  ctx.translate(c.x + c.w / 2, c.y + c.h / 2);
-  ctx.scale(0.92 + 0.08 * k, 0.92 + 0.08 * k);
-  ctx.translate(-(c.x + c.w / 2), -(c.y + c.h / 2));
-  UI.shadow(ctx, 'rgba(0,0,0,0.45)', 30, 0, 12);
-  UI.fillRR(ctx, c.x, c.y, c.w, c.h, 24, '#FFF8E8');
-  UI.clearShadow(ctx);
-
-  UI.text(ctx, '军需处验收', c.x + c.w / 2, c.y + 24, 10, T.inkSoft, 'center', 700);
-  UI.text(ctx, '本单完成', c.x + c.w / 2, c.y + 48, 21, T.ink, 'center', 900);
-
-  // 评级
-  var gx = c.x + c.w / 2;
-  var gy = c.y + 100;
-  ctx.save();
-  ctx.translate(gx, gy);
-  ctx.rotate(-0.1);
-  ctx.beginPath();
-  ctx.arc(0, 0, 34, 0, Math.PI * 2);
-  ctx.fillStyle = s.grade.color;
-  ctx.fill();
-  ctx.beginPath();
-  ctx.arc(0, 0, 27, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(255,255,255,0.55)';
-  ctx.lineWidth = 2;
-  ctx.stroke();
-  UI.text(ctx, s.grade.key, 0, 1, 34, '#FFFDF4', 'center', 900);
-  ctx.restore();
-  UI.text(ctx, s.grade.name + ' · 平均浪费 ' + (s.avgWaste * 100).toFixed(1) + '%', gx, gy + 52, 12, T.ink, 'center', 800);
-  if (s.perfectRun) {
-    UI.pill(ctx, gx - 62, gy + 64, 124, 22, 'rgba(242,184,75,0.2)');
-    UI.text(ctx, '完美手感 · 收益 +12%', gx, gy + 75, 9.5, T.goldDark, 'center', 800);
-  }
-
-  // 统计
-  var rowY = c.y + 208;
-  var rows = [
-    { label: '完成土豆', value: this.results.length + ' / ' + this.order.count + ' 颗' },
-    { label: 'S 评级', value: s.sCount + ' 颗' },
-    { label: '木桶加成', value: '+' + Math.round((s.coinMul - 1) * 100) + '%' }
-  ];
-  for (var i = 0; i < rows.length; i++) {
-    UI.text(ctx, rows[i].label, c.x + 26, rowY + i * 24, 11, T.inkSoft, 'left', 600);
-    UI.text(ctx, rows[i].value, c.x + c.w - 26, rowY + i * 24, 11, T.ink, 'right', 800);
-  }
-
-  // 金币
-  UI.text(ctx, '土豆币', c.x + c.w / 2 - 34, c.y + 284, 10, T.inkSoft, 'center', 600);
-  UI.drawCoin(ctx, c.x + c.w / 2 - 34, c.y + 304, 10);
-  UI.text(ctx, '+' + Math.round(this.coinShown), c.x + c.w / 2 + 14, c.y + 304, 22, T.goldDark, 'center', 900);
-
-  var bDouble = UI.makeButton({
-    x: this.resultDoubleBtn.x, y: this.resultDoubleBtn.y, w: this.resultDoubleBtn.w, h: this.resultDoubleBtn.h,
-    radius: 13, label: this.doubled ? '已领取双倍' : '看视频 · 金币翻倍 +' + s.coins,
-    kind: this.doubled ? 'secondary' : 'gold', size: 12, enabled: !this.doubled
-  });
-  bDouble.pressed = this.pressedAction === 'double';
-  UI.button(ctx, bDouble);
-
-  var bNext = UI.makeButton({
-    x: this.resultNextBtn.x, y: this.resultNextBtn.y, w: this.resultNextBtn.w, h: this.resultNextBtn.h,
-    radius: 15, label: '下 一 单', kind: 'primary', size: 17
-  });
-  bNext.pressed = this.pressedAction === 'next';
-  UI.button(ctx, bNext);
-
-  var bHome = UI.makeButton({
-    x: this.resultHomeBtn.x, y: this.resultHomeBtn.y, w: this.resultHomeBtn.w, h: this.resultHomeBtn.h,
-    radius: 11, label: '回大厅', kind: 'secondary', size: 11.5
-  });
-  bHome.pressed = this.pressedAction === 'home';
-  UI.button(ctx, bHome);
-  ctx.restore();
-};
-
-PlayScene.prototype.onEscape = function () {
-  if (this.state === 'play') this.openPause();
-  else if (this.state === 'paused') this.state = 'play';
-  else if (this.state === 'tutorial') this.startTutorial();
-};
-
-module.exports = PlayScene;
-
-};
-__defs["potato"] = function(module, exports, require){
-/**
- * 土豆：不规则轮廓 + 皮肤图层擦除 + 果肉浪费深度。
- * 用低分辨率网格统计削净率，避免每帧读像素。
- */
-var Platform = require('./platform');
-var CONFIG = require('./config');
-
-function rng(seed) {
-  var s = seed >>> 0;
-  return function () {
-    s = (s * 1664525 + 1013904223) >>> 0;
-    return s / 4294967296;
-  };
-}
-
-function Potato(opts) {
-  this.cx = opts.cx;
-  this.cy = opts.cy;
-  this.R = opts.R;
-  this.dpr = opts.dpr || 1;
-  this.golden = !!opts.golden;
-  this.target = opts.target || 0.86;
-  this.brush = opts.brush || 17;
-  this.wasteThreshold = Math.max(8, Math.round(opts.wasteDepth || 26));
-  this.seed = (opts.seed || Math.floor(Math.random() * 1e9)) >>> 0;
-  this.rand = rng(this.seed);
-  this.xScale = 1.06;
-  this.yScale = 0.94;
-  this.variant = Math.floor(this.rand() * 3);
-
-  this.buildRadius();
-  this.buildGrid();
-  this.buildSkin();
-  this.buildFleshBlobs();
-
-  this.peeledCells = 0;
-  this.wasteCells = 0;
-  this.lastX = null;
-  this.lastY = null;
-  this.completed = false;
-  this.introT = 0;
-  this.goneT = 0;
-  this.sparkT = 0;
-}
-
-Potato.prototype.buildRadius = function () {
-  var N = 240;
-  this.radTable = new Float32Array(N);
-  this.radN = N;
-  var p1 = this.rand() * 6.28;
-  var p2 = this.rand() * 6.28;
-  var p3 = this.rand() * 6.28;
-  for (var i = 0; i < N; i++) {
-    var th = i / N * Math.PI * 2;
-    var r = 1 +
-      0.052 * Math.sin(th * 3 + p1) +
-      0.03 * Math.sin(th * 5 + p2) +
-      0.017 * Math.sin(th * 7 + p3) +
-      0.012 * Math.sin(th * 2 + p1 * 0.7);
-    this.radTable[i] = r;
-  }
-};
-
-Potato.prototype.radiusAt = function (theta) {
-  var a = theta % (Math.PI * 2);
-  if (a < 0) a += Math.PI * 2;
-  var i = Math.floor(a / (Math.PI * 2) * this.radN) % this.radN;
-  return this.radTable[i];
-};
-
-Potato.prototype.isInside = function (x, y) {
-  var u = (x - this.cx) / (this.R * this.xScale);
-  var v = (y - this.cy) / (this.R * this.yScale);
-  var d2 = u * u + v * v;
-  if (d2 > 1.25) return false;
-  var d = Math.sqrt(d2);
-  if (d < 0.00001) return true;
-  return d <= this.radiusAt(Math.atan2(v, u));
-};
-
-Potato.prototype.buildGrid = function () {
-  var N = CONFIG.play.grid;
-  this.gw = N;
-  this.gh = N;
-  this.bw = this.R * 2 * this.xScale * 1.13;
-  this.bh = this.R * 2 * this.yScale * 1.13;
-  this.bx0 = this.cx - this.bw / 2;
-  this.by0 = this.cy - this.bh / 2;
-  this.cw = this.bw / N;
-  this.ch = this.bh / N;
-  this.inside = new Uint8Array(N * N);
-  this.state = new Uint8Array(N * N);
-  this.depth = new Uint8Array(N * N);
-  this.insideTotal = 0;
-  this.skinTotal = 0;
-  for (var gy = 0; gy < N; gy++) {
-    for (var gx = 0; gx < N; gx++) {
-      var px = this.bx0 + (gx + 0.5) * this.cw;
-      var py = this.by0 + (gy + 0.5) * this.ch;
-      var idx = gy * N + gx;
-      if (this.isInside(px, py)) {
-        this.inside[idx] = 1;
-        this.state[idx] = 1;
-        this.insideTotal++;
-        this.skinTotal++;
-      }
-    }
-  }
-};
-
-Potato.prototype.shapePath = function (ctx, scale, ox, oy) {
-  var N = 120;
-  ox = ox || 0;
-  oy = oy || 0;
-  ctx.beginPath();
-  for (var i = 0; i <= N; i++) {
-    var th = i / N * Math.PI * 2;
-    var r = this.radiusAt(th) * (scale || 1);
-    var x = ox + Math.cos(th) * this.R * this.xScale * r;
-    var y = oy + Math.sin(th) * this.R * this.yScale * r;
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  }
-  ctx.closePath();
-};
-
-Potato.prototype.skinColors = function () {
-  if (this.golden) {
-    return { top: '#F5D06B', mid: '#E2AC3F', bottom: '#B97C1F', edge: '#8A5A12' };
-  }
-  if (this.variant === 1) {
-    return { top: '#C98A5D', mid: '#A85C3C', bottom: '#7E3E27', edge: '#5E2B17' };
-  }
-  if (this.variant === 2) {
-    return { top: '#D5B073', mid: '#B98D4F', bottom: '#8E6532', edge: '#6A471E' };
-  }
-  return { top: '#C98F5B', mid: '#B0743E', bottom: '#82501F', edge: '#5F3714' };
-};
-
-Potato.prototype.buildSkin = function () {
-  var SS = this.R * 2.5;
-  this.SS = SS;
-  this.skinSize = Math.ceil(SS * this.dpr);
-  this.skin = Platform.createOffscreen(this.skinSize, this.skinSize);
-  var ctx = this.skin.getContext('2d');
-  var hasTransform = ctx.setTransform;
-  if (hasTransform) ctx.setTransform(this.dpr, 0, 0, this.dpr, this.skinSize / 2, this.skinSize / 2);
-  else { ctx.translate(this.skinSize / 2, this.skinSize / 2); ctx.scale(this.dpr, this.dpr); }
-
-  var colors = this.skinColors();
-  ctx.save();
-  this.shapePath(ctx, 1);
-  ctx.clip();
-
-  var g = ctx.createLinearGradient(-this.R, -this.R, this.R * 0.9, this.R);
-  g.addColorStop(0, colors.top);
-  g.addColorStop(0.5, colors.mid);
-  g.addColorStop(1, colors.bottom);
-  ctx.fillStyle = g;
-  ctx.fillRect(-SS, -SS, SS * 2, SS * 2);
-
-  // 皮面颗粒
-  for (var i = 0; i < 210; i++) {
-    var a = this.rand() * Math.PI * 2;
-    var d = Math.sqrt(this.rand()) * 1.02;
-    var x = Math.cos(a) * this.R * this.xScale * d;
-    var y = Math.sin(a) * this.R * this.yScale * d;
-    var sz = 0.5 + this.rand() * 1.9;
-    ctx.beginPath();
-    ctx.arc(x, y, sz, 0, Math.PI * 2);
-    ctx.fillStyle = this.rand() > 0.5 ? 'rgba(255,235,190,0.18)' : 'rgba(70,38,12,0.18)';
-    ctx.fill();
-  }
-  // 深色芽眼
-  var eyes = 5 + Math.floor(this.rand() * 5);
-  for (var e = 0; e < eyes; e++) {
-    var ea = this.rand() * Math.PI * 2;
-    var ed = Math.sqrt(this.rand()) * 0.92;
-    var ex = Math.cos(ea) * this.R * this.xScale * ed;
-    var ey = Math.sin(ea) * this.R * this.yScale * ed;
-    var er = 1.5 + this.rand() * 3.2;
-    ctx.beginPath();
-    ctx.ellipse ? ctx.ellipse(ex, ey, er * 1.25, er, this.rand() * 3, 0, Math.PI * 2) : ctx.arc(ex, ey, er, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(70,38,12,0.55)';
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(ex - er * 0.25, ey - er * 0.25, er * 0.42, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,230,180,0.35)';
-    ctx.fill();
-  }
-
-  // 边缘暗部
-  this.shapePath(ctx, 0.995);
-  ctx.lineWidth = this.R * 0.12;
-  ctx.strokeStyle = this.golden ? 'rgba(120,75,10,0.35)' : 'rgba(70,40,15,0.32)';
-  ctx.stroke();
-
-  // 左上高光
-  var hg = ctx.createRadialGradient(-this.R * 0.32, -this.R * 0.38, this.R * 0.05, -this.R * 0.32, -this.R * 0.38, this.R * 0.95);
-  hg.addColorStop(0, 'rgba(255,248,220,0.24)');
-  hg.addColorStop(1, 'rgba(255,248,220,0)');
-  ctx.fillStyle = hg;
-  ctx.fillRect(-SS, -SS, SS * 2, SS * 2);
-
-  ctx.restore();
-};
-
-Potato.prototype.buildFleshBlobs = function () {
-  this.blobs = [];
-  for (var i = 0; i < 26; i++) {
-    var a = this.rand() * Math.PI * 2;
-    var d = Math.sqrt(this.rand()) * 0.9;
-    this.blobs.push({
-      x: Math.cos(a) * this.R * this.xScale * d,
-      y: Math.sin(a) * this.R * this.yScale * d,
-      rx: this.R * (0.05 + this.rand() * 0.1),
-      ry: this.R * (0.04 + this.rand() * 0.08),
-      a: 0.04 + this.rand() * 0.08,
-      rot: this.rand() * Math.PI
-    });
-  }
-};
-
-Potato.prototype.beginStroke = function (x, y) {
-  this.lastX = x;
-  this.lastY = y;
-};
-
-Potato.prototype.endStroke = function () {
-  this.lastX = null;
-  this.lastY = null;
-};
-
-Potato.prototype.peelTo = function (x, y) {
-  if (this.lastX === null) {
-    this.lastX = x;
-    this.lastY = y;
-    return { removed: 0, wasteAdded: 0 };
-  }
-  var x1 = this.lastX;
-  var y1 = this.lastY;
-  var dx = x - x1;
-  var dy = y - y1;
-  var dist = Math.sqrt(dx * dx + dy * dy);
-  if (dist < 0.4) return { removed: 0, wasteAdded: 0 };
-
-  this.eraseTrail(x1, y1, x, y);
-
-  var step = CONFIG.play.stampStep;
-  var steps = Math.max(1, Math.ceil(dist / step));
-  var beforePeel = this.peeledCells;
-  var beforeWaste = this.wasteCells;
-  var moving = dist > 1.2;
-  for (var i = 1; i <= steps; i++) {
-    var t = i / steps;
-    this.stamp(x1 + dx * t, y1 + dy * t, this.brush, moving);
-  }
-  this.lastX = x;
-  this.lastY = y;
-
-  if (this.peeledCells / this.skinTotal >= this.target) this.completed = true;
-
-  return {
-    removed: this.peeledCells - beforePeel,
-    wasteAdded: this.wasteCells - beforeWaste
-  };
-};
-
-Potato.prototype.stamp = function (x, y, r, moving) {
-  var gw = this.gw;
-  var cw = this.cw;
-  var ch = this.ch;
-  var gx0 = Math.max(0, Math.floor((x - r - this.bx0) / cw));
-  var gx1 = Math.min(gw - 1, Math.floor((x + r - this.bx0) / cw));
-  var gy0 = Math.max(0, Math.floor((y - r - this.by0) / ch));
-  var gy1 = Math.min(this.gh - 1, Math.floor((y + r - this.by0) / ch));
-  var r2 = r * r;
-  for (var gy = gy0; gy <= gy1; gy++) {
-    var py = this.by0 + (gy + 0.5) * ch;
-    var row = gy * gw;
-    for (var gx = gx0; gx <= gx1; gx++) {
-      var idx = row + gx;
-      if (!this.inside[idx]) continue;
-      var px = this.bx0 + (gx + 0.5) * cw;
-      var ddx = px - x;
-      var ddy = py - y;
-      if (ddx * ddx + ddy * ddy > r2) continue;
-      if (this.state[idx] === 1) {
-        this.state[idx] = 2;
-        this.peeledCells++;
-      } else if (moving && this.depth[idx] < this.wasteThreshold) {
-        this.depth[idx]++;
-        if (this.depth[idx] === this.wasteThreshold) this.wasteCells++;
-      }
-    }
-  }
-};
-
-Potato.prototype.eraseTrail = function (x1, y1, x2, y2) {
-  if (!this.skin) return;
-  var ctx = this.skin.getContext('2d');
-  ctx.save();
-  if (ctx.setTransform) ctx.setTransform(this.dpr, 0, 0, this.dpr, this.skinSize / 2, this.skinSize / 2);
-  else { ctx.translate(this.skinSize / 2, this.skinSize / 2); ctx.scale(this.dpr, this.dpr); }
-  ctx.globalCompositeOperation = 'destination-out';
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  ctx.strokeStyle = 'rgba(0,0,0,1)';
-  ctx.lineWidth = this.brush * 1.9;
-  ctx.beginPath();
-  ctx.moveTo(x1 - this.cx, y1 - this.cy);
-  ctx.lineTo(x2 - this.cx, y2 - this.cy);
-  ctx.stroke();
-
-  // 轻微毛边，让削痕更像刀口
-  ctx.lineWidth = this.brush * 0.38;
-  for (var i = 0; i < 3; i++) {
-    var ox = (this.rand() - 0.5) * this.brush * 1.5;
-    var oy = (this.rand() - 0.5) * this.brush * 1.5;
-    ctx.beginPath();
-    ctx.moveTo(x1 - this.cx + ox, y1 - this.cy + oy);
-    ctx.lineTo(x2 - this.cx + ox, y2 - this.cy + oy);
-    ctx.stroke();
-  }
-  ctx.restore();
-};
-
-Potato.prototype.progress = function () {
-  return Math.min(1, this.peeledCells / Math.max(1, this.skinTotal));
-};
-
-Potato.prototype.waste = function () {
-  return Math.min(1, this.wasteCells / Math.max(1, this.insideTotal));
-};
-
-Potato.prototype.render = function (ctx, t) {
-  var cx = this.cx;
-  var cy = this.cy;
-  var R = this.R;
-  var intro = this.introT;
-  var scale = intro < 1 ? 0.82 + 0.18 * intro : 1;
-  var alpha = Math.min(1, intro * 1.6) * (1 - this.goneT);
-
-  ctx.save();
-  ctx.translate(cx, cy - (1 - intro) * 40);
-  ctx.scale(scale, scale);
-  ctx.translate(-cx, -cy);
-  ctx.globalAlpha = alpha;
-
-  // 接触阴影
-  ctx.save();
-  ctx.beginPath();
-  ctx.ellipse ? ctx.ellipse(cx, cy + R * 0.92, R * 0.72, R * 0.14, 0, 0, Math.PI * 2) :
-    ctx.arc(cx, cy + R * 0.92, R * 0.3, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(70,40,15,0.2)';
-  ctx.fill();
-  ctx.restore();
-
-  // 果肉外投影，避免削净后与奶油色背景糊在一起
-  ctx.save();
-  ctx.shadowColor = 'rgba(80,45,18,0.3)';
-  ctx.shadowBlur = 18;
-  ctx.shadowOffsetY = 7;
-  this.shapePath(ctx, 1, cx, cy);
-  ctx.fillStyle = '#E6C58B';
-  ctx.fill();
-  ctx.restore();
-
-  // 果肉
-  ctx.save();
-  this.shapePath(ctx, 1, cx, cy);
-  ctx.clip();
-  var g = ctx.createRadialGradient(cx - R * 0.3, cy - R * 0.35, R * 0.1, cx, cy, R * 1.3);
-  g.addColorStop(0, '#FFF5D6');
-  g.addColorStop(0.55, '#F6E2AC');
-  g.addColorStop(1, '#DFBC77');
-  ctx.fillStyle = g;
-  ctx.fillRect(cx - R * 1.4, cy - R * 1.4, R * 2.8, R * 2.8);
-
-  for (var i = 0; i < this.blobs.length; i++) {
-    var b = this.blobs[i];
-    ctx.save();
-    ctx.translate(cx + b.x, cy + b.y);
-    ctx.rotate(b.rot);
-    ctx.scale(b.rx, b.ry);
-    ctx.beginPath();
-    ctx.arc(0, 0, 1, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(210,166,98,' + b.a + ')';
-    ctx.fill();
-    ctx.restore();
-  }
-
-  this.shapePath(ctx, 0.995, cx, cy);
-  ctx.lineWidth = R * 0.2;
-  ctx.strokeStyle = 'rgba(150,104,45,0.22)';
-  ctx.stroke();
-  ctx.restore();
-
-  // 皮肤图层
-  if (this.skin) {
-    ctx.drawImage(this.skin, cx - this.SS / 2, cy - this.SS / 2, this.SS, this.SS);
-  }
-
-  // 轮廓
-  this.shapePath(ctx, 1.012, cx, cy);
-  ctx.lineWidth = 2.2;
-  ctx.strokeStyle = this.golden ? 'rgba(120,78,15,0.62)' : 'rgba(90,52,20,0.5)';
-  ctx.stroke();
-
-  // 小芽
-  if (this.goneT < 0.5) {
-    var sx = cx + R * 0.18;
-    var sy = cy - R * 0.92;
-    ctx.save();
-    ctx.strokeStyle = '#5E8B45';
-    ctx.lineWidth = Math.max(2, R * 0.025);
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.moveTo(sx, sy + R * 0.12);
-    ctx.quadraticCurveTo(sx + R * 0.02, sy - R * 0.04, sx + R * 0.12, sy - R * 0.12);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.ellipse ? ctx.ellipse(sx + R * 0.15, sy - R * 0.15, R * 0.1, R * 0.055, -0.5, 0, Math.PI * 2) :
-      ctx.arc(sx + R * 0.12, sy - R * 0.12, R * 0.08, 0, Math.PI * 2);
-    ctx.fillStyle = '#7FB069';
-    ctx.fill();
-    ctx.restore();
-  }
-
-  // 金土豆闪光
-  if (this.golden) {
-    var tw = 0.6 + 0.4 * Math.sin(t * 3 + this.seed);
-    for (var k = 0; k < 4; k++) {
-      var a2 = t * 0.8 + k * Math.PI / 2 + this.seed;
-      var px2 = cx + Math.cos(a2) * R * 0.62;
-      var py2 = cy + Math.sin(a2) * R * 0.2 - R * 0.3;
-      drawSpark(ctx, px2, py2, R * 0.045 * (0.6 + tw), 'rgba(255,245,180,' + (0.4 + tw * 0.4) + ')');
-    }
-  }
-
-  // 完成光晕
-  if (this.progress() >= this.target && this.goneT < 0.2) {
-    var pulse = 0.5 + 0.5 * Math.sin(t * 5);
-    ctx.save();
-    this.shapePath(ctx, 1.035 + pulse * 0.02, cx, cy);
-    ctx.lineWidth = 4 + pulse * 3;
-    ctx.strokeStyle = 'rgba(255,214,110,' + (0.35 + pulse * 0.35) + ')';
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  ctx.restore();
-};
-
-function drawSpark(ctx, x, y, r, color) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.beginPath();
-  ctx.moveTo(0, -r);
-  ctx.quadraticCurveTo(r * 0.18, -r * 0.18, r, 0);
-  ctx.quadraticCurveTo(r * 0.18, r * 0.18, 0, r);
-  ctx.quadraticCurveTo(-r * 0.18, r * 0.18, -r, 0);
-  ctx.quadraticCurveTo(-r * 0.18, -r * 0.18, 0, -r);
-  ctx.fillStyle = color;
-  ctx.fill();
-  ctx.restore();
-}
-
-Potato.prototype.dispose = function () {
-  if (this.skin) {
-    this.skin.width = 1;
-    this.skin.height = 1;
-    this.skin = null;
-  }
-};
-
-module.exports = Potato;
-
-};
-__defs["fx"] = function(module, exports, require){
-/**
- * 削皮碎屑、星光与飘字。
- */
-function FX() {
-  this.parts = [];
-  this.texts = [];
-}
-
-FX.prototype.peelBurst = function (x, y, dx, dy, count, golden) {
-  var len = Math.sqrt(dx * dx + dy * dy) || 1;
-  var nx = -dy / len;
-  var ny = dx / len;
-  var palette = golden ? ['#F2C85B', '#E2AC3F', '#FFF0B8'] : ['#B0743E', '#C98F5B', '#8A5326'];
-  for (var i = 0; i < count; i++) {
-    var side = Math.random() > 0.5 ? 1 : -1;
-    var sp = 40 + Math.random() * 110;
-    this.parts.push({
-      type: 'curl',
-      x: x + (Math.random() - 0.5) * 18,
-      y: y + (Math.random() - 0.5) * 18,
-      vx: nx * sp * side + (Math.random() - 0.5) * 30,
-      vy: ny * sp * side - 40 - Math.random() * 60,
-      g: 520,
-      rot: Math.random() * 6.28,
-      vr: (Math.random() - 0.5) * 9,
-      size: 4 + Math.random() * 6,
-      color: palette[Math.floor(Math.random() * palette.length)],
-      life: 0.5 + Math.random() * 0.5,
-      ttl: 1
-    });
-  }
-  if (this.parts.length > 180) this.parts.splice(0, this.parts.length - 180);
-};
-
-FX.prototype.sparkle = function (x, y, count, color, spread) {
-  spread = spread || 40;
-  for (var i = 0; i < count; i++) {
-    var a = Math.random() * Math.PI * 2;
-    var sp = 30 + Math.random() * 130;
-    this.parts.push({
-      type: 'spark',
-      x: x,
-      y: y,
-      vx: Math.cos(a) * sp,
-      vy: Math.sin(a) * sp - 40,
-      g: 260,
-      rot: Math.random() * 6.28,
-      vr: (Math.random() - 0.5) * 6,
-      size: 3 + Math.random() * 5,
-      color: color || '#F2B84B',
-      life: 0.45 + Math.random() * 0.6,
-      ttl: 1
-    });
-  }
-};
-
-FX.prototype.floatText = function (x, y, str, color, size) {
-  this.texts.push({
-    x: x,
-    y: y,
-    str: str,
-    color: color || '#4A2E19',
-    size: size || 22,
-    life: 1.0,
-    ttl: 1.0
-  });
-};
-
-FX.prototype.update = function (dt) {
-  var i;
-  for (i = this.parts.length - 1; i >= 0; i--) {
-    var p = this.parts[i];
-    p.life -= dt;
-    if (p.life <= 0) { this.parts.splice(i, 1); continue; }
-    p.vy += p.g * dt;
-    p.vx *= 0.985;
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    p.rot += p.vr * dt;
-  }
-  for (i = this.texts.length - 1; i >= 0; i--) {
-    var t = this.texts[i];
-    t.life -= dt;
-    if (t.life <= 0) { this.texts.splice(i, 1); continue; }
-    t.y -= 42 * dt;
-  }
-};
-
-FX.prototype.render = function (ctx) {
-  for (var i = 0; i < this.parts.length; i++) {
-    var p = this.parts[i];
-    var a = Math.max(0, Math.min(1, p.life / p.ttl));
-    ctx.save();
-    ctx.globalAlpha = a;
-    ctx.translate(p.x, p.y);
-    ctx.rotate(p.rot);
-    if (p.type === 'spark') {
-      ctx.fillStyle = p.color;
-      ctx.beginPath();
-      var r = p.size;
-      ctx.moveTo(0, -r);
-      ctx.quadraticCurveTo(r * 0.2, -r * 0.2, r, 0);
-      ctx.quadraticCurveTo(r * 0.2, r * 0.2, 0, r);
-      ctx.quadraticCurveTo(-r * 0.2, r * 0.2, -r, 0);
-      ctx.quadraticCurveTo(-r * 0.2, -r * 0.2, 0, -r);
-      ctx.fill();
-    } else {
-      ctx.strokeStyle = p.color;
-      ctx.lineWidth = Math.max(1.5, p.size * 0.34);
-      ctx.lineCap = 'round';
-      ctx.beginPath();
-      ctx.arc(0, 0, p.size, 0.4, 2.5);
-      ctx.stroke();
-      ctx.strokeStyle = 'rgba(255,245,215,0.45)';
-      ctx.lineWidth = Math.max(1, p.size * 0.14);
-      ctx.beginPath();
-      ctx.arc(0, 0, p.size, 0.55, 2.2);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-  for (var j = 0; j < this.texts.length; j++) {
-    var t = this.texts[j];
-    var al = Math.max(0, Math.min(1, t.life / t.ttl));
-    ctx.save();
-    ctx.globalAlpha = al;
-    ctx.font = '800 ' + t.size + 'px "PingFang SC","Microsoft YaHei",sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.lineWidth = 4;
-    ctx.strokeStyle = 'rgba(255,248,230,0.9)';
-    ctx.strokeText(t.str, t.x, t.y);
-    ctx.fillStyle = t.color;
-    ctx.fillText(t.str, t.x, t.y);
-    ctx.restore();
-  }
-};
-
-FX.prototype.clear = function () {
-  this.parts.length = 0;
-  this.texts.length = 0;
-};
-
-module.exports = FX;
-
-};
-__defs["spike3d"] = function(module, exports, require){
-/**
- * Task 1 技术验证（Spike）：
- * 验证在微信小游戏中「主画布 WebGL(Three.js) + 离屏 2D 画布作 UI 纹理合成 + 射线取 UV」可行。
- * 同时兼容浏览器（index.html?spike=1），用同一套代码验证预打包的 three 能正常运行。
- * 验证通过后此文件会被正式的 render3d.js 替代。
- */
 var loader = require('./three-loader');
 var loadTHREE = loader.loadTHREE;
 var isWx = loader.isWx;
+
+var _state = {
+  THREE: null,
+  initialized: false,
+
+  glCanvas: null,   // WebGL 上屏（物理尺寸 W*dpr × H*dpr）
+  uiCanvas: null,   // 离屏 2D（物理尺寸 W*dpr × H*dpr）
+  uictx: null,
+
+  renderer: null,
+  scene: null,
+  camera: null,
+  uiScene: null,
+  uiCam: null,
+  uiQuad: null,
+  uiTexture: null,
+
+  potato: null,
+  potatoSkin: null,
+  skinCanvas: null,
+  skinCtx: null,
+  potatoInner: null,
+
+  raycaster: null,
+  pointer: null,
+
+  W: 0, H: 0, dpr: 1,
+
+  // OrbitControls 状态
+  orbiter: {
+    // 球坐标（绕土豆中心）
+    radius: 6.2,        // 相机距离
+    theta: 0,           // 水平角（绕 Y 轴），0 = 正对
+    phi: Math.PI / 2.2, // 垂直角（俯视角），越小越俯视
+    minRadius: 4.5,
+    maxRadius: 10,
+    minPhi: Math.PI / 6,
+    maxPhi: Math.PI / 2 - 0.05,
+    targetX: 0, targetY: 0, targetZ: 0,
+    // 上一帧拖拽点（用于两指手势旋转计算）
+    lastMidX: 0, lastMidY: 0,
+    lastDist: 0,
+    active: false,    // 是否正在两指控制
+    pinchActive: false
+  },
+
+  potatoVisible: false,
+  peelPaused: false,
+
+  // 工具（削皮 / 叉子 / 刨丝）
+  tool: 'knife',
+  toolSize: 18
+};
 
 function makeCanvas(w, h) {
   var c = isWx ? wx.createCanvas() : document.createElement('canvas');
@@ -5405,154 +2527,491 @@ function makeCanvas(w, h) {
   return c;
 }
 
-function run() {
-  var info = isWx
-    ? wx.getSystemInfoSync()
-    : { windowWidth: window.innerWidth, windowHeight: window.innerHeight, pixelRatio: window.devicePixelRatio || 1 };
-  var W = info.windowWidth;
-  var H = info.windowHeight;
-  var dpr = info.pixelRatio || 1;
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
-  var glCanvas, uiCanvas, uictx;
+function init() {
+  if (_state.initialized) return;
+  var info;
   if (isWx) {
-    glCanvas = wx.createCanvas();  // 第一个 = 上屏 WebGL 画布
-    uiCanvas = wx.createCanvas();  // 第二个 = 离屏 2D 画布（UI 层）
+    try { info = wx.getWindowInfo ? wx.getWindowInfo() : wx.getSystemInfoSync(); } catch (e) { info = { windowWidth: 375, windowHeight: 667, pixelRatio: 2 }; }
   } else {
-    glCanvas = document.createElement('canvas');
-    glCanvas.style.cssText = 'position:fixed;left:0;top:0;width:100vw;height:100vh;display:block;touch-action:none;';
-    document.body.appendChild(glCanvas);
-    uiCanvas = document.createElement('canvas');
+    info = { windowWidth: window.innerWidth, windowHeight: window.innerHeight, pixelRatio: window.devicePixelRatio || 1 };
   }
-  glCanvas.width = W;
-  glCanvas.height = H;
-  uiCanvas.width = W;
-  uiCanvas.height = H;
-  uictx = uiCanvas.getContext('2d');
 
-  var THREE, renderer, scene, camera, cube, uiScene, uiCam, uiQuad, uiTexture, raycaster, pointer, lastUV;
+  _state.W = info.windowWidth;
+  _state.H = info.windowHeight;
+  _state.dpr = Math.min(info.pixelRatio || 1, 3);
+
+  // glCanvas：WebGL 上屏（dpr 倍物理像素）
+  if (isWx) {
+    _state.glCanvas = wx.createCanvas();
+    _state.uiCanvas = wx.createCanvas();
+  } else {
+    _state.glCanvas = document.createElement('canvas');
+    _state.glCanvas.style.cssText = 'position:fixed;left:0;top:0;width:' + _state.W + 'px;height:' + _state.H + 'px;display:block;touch-action:none;z-index:0;';
+    document.body.appendChild(_state.glCanvas);
+    _state.uiCanvas = document.createElement('canvas');
+  }
+  _state.glCanvas.width = Math.floor(_state.W * _state.dpr);
+  _state.glCanvas.height = Math.floor(_state.H * _state.dpr);
+  _state.uiCanvas.width = Math.floor(_state.W * _state.dpr);
+  _state.uiCanvas.height = Math.floor(_state.H * _state.dpr);
+  _state.uictx = _state.uiCanvas.getContext('2d');
 
   try {
-    THREE = loadTHREE(glCanvas);
+    var THREE = loadTHREE(_state.glCanvas);
+    _state.THREE = THREE;
 
-    var gl = glCanvas.getContext('webgl') || glCanvas.getContext('experimental-webgl');
+    var gl = _state.glCanvas.getContext('webgl') || _state.glCanvas.getContext('experimental-webgl');
     if (!gl) throw new Error('WebGL context unavailable');
 
-    renderer = new THREE.WebGLRenderer({ canvas: glCanvas, context: gl, antialias: true });
-    renderer.setPixelRatio(dpr);
-    renderer.setSize(W, H, false);
+    _state.renderer = new THREE.WebGLRenderer({ canvas: _state.glCanvas, context: gl, antialias: true });
+    _state.renderer.setPixelRatio(1); // 已经手动设了 dpr 倍物理尺寸
+    _state.renderer.setSize(_state.W * _state.dpr, _state.H * _state.dpr, false);
+    _state.renderer.setClearColor(0x2a1a10, 1);
 
-    scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x2a1a10);
-    camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 100);
-    camera.position.set(0, 0, 4);
+    _state.scene = new THREE.Scene();
 
-    // 程序生成一张带网格的纹理，方便确认 UV 与旋转
-    var tc = makeCanvas(256, 256);
-    var tx = tc.getContext('2d');
-    tx.fillStyle = '#c89b6b'; tx.fillRect(0, 0, 256, 256);
-    tx.strokeStyle = '#5a3a1c'; tx.lineWidth = 2;
-    for (var i = 0; i <= 256; i += 32) {
-      tx.beginPath(); tx.moveTo(i, 0); tx.lineTo(i, 256); tx.stroke();
-      tx.beginPath(); tx.moveTo(0, i); tx.lineTo(256, i); tx.stroke();
-    }
-    tx.fillStyle = '#fff'; tx.font = 'bold 40px sans-serif'; tx.textAlign = 'center';
-    tx.fillText('UV', 128, 145);
-    var cubeTex = new THREE.CanvasTexture(tc);
+    // PerspectiveCamera：土豆正前方，略俯
+    _state.camera = new THREE.PerspectiveCamera(48, _state.W / _state.H, 0.1, 200);
+    _updateOrbiterCamera();
 
-    cube = new THREE.Mesh(
-      new THREE.BoxGeometry(2, 2, 2),
-      new THREE.MeshLambertMaterial({ map: cubeTex })
+    // 光照（更强，更立体）
+    _state.scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+    var key = new THREE.DirectionalLight(0xffffff, 0.9);
+    key.position.set(3, 5, 4);
+    _state.scene.add(key);
+    var rim = new THREE.DirectionalLight(0xffa060, 0.4);
+    rim.position.set(-4, 3, -3);
+    _state.scene.add(rim);
+    var fill = new THREE.DirectionalLight(0xfff3d0, 0.25);
+    fill.position.set(0, -3, 4);
+    _state.scene.add(fill);
+
+    // 地面阴影接收（一个透明圆盘，让土豆有"放在桌子上"的感觉）
+    var shadowGeo = new THREE.CircleGeometry(3.5, 32);
+    var shadowMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.22 });
+    var shadow = new THREE.Mesh(shadowGeo, shadowMat);
+    shadow.rotation.x = -Math.PI / 2;
+    shadow.position.y = -1.6;
+    _state.scene.add(shadow);
+
+    // 土豆
+    _buildPotato();
+
+    // UI 层：全屏 quad（canvas 也是 dpr 倍，所以 Plane 也用 dpr 倍尺寸，OrthographicCamera 也设 dpr 倍范围）
+    var canvasW = _state.uiCanvas.width;   // W * dpr
+    var canvasH = _state.uiCanvas.height;  // H * dpr
+    _state.uiTexture = new THREE.CanvasTexture(_state.uiCanvas);
+    _state.uiScene = new THREE.Scene();
+    _state.uiCam = new THREE.OrthographicCamera(-canvasW / 2, canvasW / 2, canvasH / 2, -canvasH / 2, 0, 10);
+    _state.uiQuad = new THREE.Mesh(
+      new THREE.PlaneGeometry(canvasW, canvasH),
+      new THREE.MeshBasicMaterial({ map: _state.uiTexture, transparent: true, depthTest: false, depthWrite: false })
     );
-    scene.add(cube);
-    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-    var dir = new THREE.DirectionalLight(0xffffff, 0.8);
-    dir.position.set(3, 4, 5);
-    scene.add(dir);
+    _state.uiQuad.renderOrder = 999;
+    _state.uiScene.add(_state.uiQuad);
 
-    // UI 层：离屏 2D 画布 → 全屏纹理 quad 叠加
-    uiTexture = new THREE.CanvasTexture(uiCanvas);
-    uiScene = new THREE.Scene();
-    uiCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, 0, 10);
-    uiQuad = new THREE.Mesh(
-      new THREE.PlaneGeometry(W, H),
-      new THREE.MeshBasicMaterial({ map: uiTexture, transparent: true, depthTest: false, depthWrite: false })
-    );
-    uiQuad.renderOrder = 999;
-    uiScene.add(uiQuad);
+    _state.raycaster = new THREE.Raycaster();
+    _state.pointer = new THREE.Vector2();
 
-    // 射线检测
-    raycaster = new THREE.Raycaster();
-    pointer = new THREE.Vector2();
-    lastUV = null;
+    // 绑定两指手势到 glCanvas（旋转/缩放视角）
+    _bindOrbitControls();
+
+    _state.initialized = true;
+    console.log('[render3d v2] init ok, W=' + _state.W + ' H=' + _state.H + ' dpr=' + _state.dpr);
   } catch (e) {
-    console.error('[spike3d] init failed:', e && e.message ? e.message : e);
-    if (typeof wx !== 'undefined' && wx.showToast) {
-      wx.showToast({ title: '3D spike 初始化失败', icon: 'none' });
-    }
-    return;
+    console.error('[render3d] init failed:', e && e.message ? e.message : e);
+    throw e;
   }
-
-  function onMove(x, y) {
-    pointer.x = (x / W) * 2 - 1;
-    pointer.y = -(y / H) * 2 + 1;
-    raycaster.setFromCamera(pointer, camera);
-    var hits = raycaster.intersectObject(cube, false);
-    if (hits.length && hits[0].uv) {
-      var uv = hits[0].uv;
-      lastUV = { x: uv.x, y: uv.y, px: x, py: y };
-    } else {
-      lastUV = null;
-    }
-  }
-
-  if (isWx) {
-    wx.onTouchStart(function (e) { if (e.touches && e.touches[0]) onMove(e.touches[0].clientX, e.touches[0].clientY); });
-    wx.onTouchMove(function (e) { if (e.touches && e.touches[0]) onMove(e.touches[0].clientX, e.touches[0].clientY); });
-  } else {
-    glCanvas.addEventListener('mousemove', function (e) { onMove(e.clientX, e.clientY); });
-    glCanvas.addEventListener('touchmove', function (e) { if (e.touches && e.touches[0]) onMove(e.touches[0].clientX, e.touches[0].clientY); }, { passive: true });
-  }
-
-  function drawUI() {
-    uictx.clearRect(0, 0, W, H);
-    uictx.fillStyle = 'rgba(20,12,6,0.6)';
-    uictx.fillRect(0, 0, W, 70);
-    uictx.fillStyle = '#f7e3ae';
-    uictx.font = 'bold 22px sans-serif';
-    uictx.textAlign = 'left';
-    uictx.fillText(isWx ? '3D SPIKE: WebGL立方体 + 离屏UI合成' : '3D SPIKE (browser): WebGL + UI composite', 16, 44);
-    if (lastUV) {
-      uictx.fillStyle = 'rgba(40,80,40,0.75)';
-      uictx.fillRect(W - 250, H - 78, 240, 68);
-      uictx.fillStyle = '#aef7b0';
-      uictx.font = '14px monospace';
-      uictx.textAlign = 'left';
-      uictx.fillText('HIT UV = (' + lastUV.x.toFixed(3) + ', ' + lastUV.y.toFixed(3) + ')', W - 240, H - 50);
-      uictx.fillText('pointer = (' + lastUV.px.toFixed(0) + ', ' + lastUV.py.toFixed(0) + ')', W - 240, H - 30);
-    }
-    uiTexture.needsUpdate = true;
-  }
-
-  var t0 = Date.now();
-  var raf = (typeof requestAnimationFrame !== 'undefined') ? requestAnimationFrame : (isWx ? null : window.requestAnimationFrame);
-  function loop() {
-    var t = (Date.now() - t0) / 1000;
-    cube.rotation.x = t * 0.5;
-    cube.rotation.y = t * 0.7;
-    drawUI();
-    renderer.autoClear = true;
-    renderer.render(scene, camera);
-    renderer.autoClear = false;
-    renderer.clearDepth();
-    renderer.render(uiScene, uiCam);
-    if (raf) raf(loop);
-  }
-  loop();
-
-  console.log('[spike3d] running, env=' + (isWx ? 'wechat' : 'browser'));
 }
 
-module.exports = { run: run };
+function _updateOrbiterCamera() {
+  var o = _state.orbiter;
+  var THREE = _state.THREE;
+  var x = o.radius * Math.sin(o.phi) * Math.sin(o.theta);
+  var y = o.radius * Math.cos(o.phi);
+  var z = o.radius * Math.sin(o.phi) * Math.cos(o.theta);
+  _state.camera.position.set(o.targetX + x, o.targetY + y, o.targetZ + z);
+  _state.camera.lookAt(o.targetX, o.targetY, o.targetZ);
+}
+
+function _bindOrbitControls() {
+  var canvas = _state.glCanvas;
+  var activePointers = {}; // { pointerId: {x, y} }
+  var orbiter = _state.orbiter;
+
+  if (isWx) {
+    // 微信环境：touch 事件
+    wx.onTouchStart(function (e) {
+      for (var i = 0; i < e.touches.length; i++) {
+        var t = e.touches[i];
+        activePointers[t.identifier] = { x: t.clientX, y: t.clientY };
+      }
+      _onOrbitTouchStart(activePointers);
+    });
+    wx.onTouchMove(function (e) {
+      for (var i = 0; i < e.touches.length; i++) {
+        var t = e.touches[i];
+        if (activePointers[t.identifier]) {
+          activePointers[t.identifier].x = t.clientX;
+          activePointers[t.identifier].y = t.clientY;
+        }
+      }
+      _onOrbitTouchMove(activePointers);
+    });
+    wx.onTouchEnd(function (e) {
+      for (var i = 0; i < e.changedTouches.length; i++) {
+        delete activePointers[e.changedTouches[i].identifier];
+      }
+      _onOrbitTouchEnd(activePointers);
+    });
+    wx.onTouchCancel(function (e) {
+      for (var i = 0; i < e.changedTouches.length; i++) {
+        delete activePointers[e.changedTouches[i].identifier];
+      }
+      _onOrbitTouchEnd(activePointers);
+    });
+  } else {
+    canvas.addEventListener('pointerdown', function (ev) {
+      canvas.setPointerCapture && canvas.setPointerCapture(ev.pointerId);
+      activePointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+      _onOrbitTouchStart(activePointers);
+    });
+    canvas.addEventListener('pointermove', function (ev) {
+      if (!activePointers[ev.pointerId]) return;
+      activePointers[ev.pointerId].x = ev.clientX;
+      activePointers[ev.pointerId].y = ev.clientY;
+      _onOrbitTouchMove(activePointers);
+    });
+    var end = function (ev) {
+      delete activePointers[ev.pointerId];
+      _onOrbitTouchEnd(activePointers);
+    };
+    canvas.addEventListener('pointerup', end);
+    canvas.addEventListener('pointercancel', end);
+  }
+}
+
+function _countKeys(obj) { var n = 0; for (var k in obj) if (obj.hasOwnProperty(k)) n++; return n; }
+
+function _onOrbitTouchStart(pointers) {
+  var n = _countKeys(pointers);
+  if (n >= 2) {
+    orbiter.active = true;
+    orbiter.pinchActive = true;
+    var ids = Object.keys(pointers);
+    var p1 = pointers[ids[0]], p2 = pointers[ids[1]];
+    orbiter.lastMidX = (p1.x + p2.x) / 2;
+    orbiter.lastMidY = (p1.y + p2.y) / 2;
+    orbiter.lastDist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+  }
+}
+
+function _onOrbitTouchMove(pointers) {
+  var n = _countKeys(pointers);
+  if (n < 2) return;
+  var ids = Object.keys(pointers);
+  var p1 = pointers[ids[0]], p2 = pointers[ids[1]];
+  var midX = (p1.x + p2.x) / 2;
+  var midY = (p1.y + p2.y) / 2;
+  var dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+
+  var dx = midX - orbiter.lastMidX;
+  var dy = midY - orbiter.lastMidY;
+  orbiter.lastMidX = midX;
+  orbiter.lastMidY = midY;
+
+  // 旋转：水平拖 → theta, 垂直拖 → phi
+  orbiter.theta -= dx * 0.006;
+  orbiter.phi = clamp(orbiter.phi - dy * 0.005, orbiter.minPhi, orbiter.maxPhi);
+
+  // 缩放：捏合
+  var dscale = orbiter.lastDist / dist;
+  if (dscale > 0 && dscale < 5) {
+    orbiter.radius = clamp(orbiter.radius * dscale, orbiter.minRadius, orbiter.maxRadius);
+  }
+  orbiter.lastDist = dist;
+
+  _updateOrbiterCamera();
+}
+
+function _onOrbitTouchEnd(pointers) {
+  var n = _countKeys(pointers);
+  if (n < 2) {
+    orbiter.active = false;
+    orbiter.pinchActive = false;
+  }
+}
+
+// ============ 土豆 ============
+
+function _buildPotato() {
+  var THREE = _state.THREE;
+
+  var geo = new THREE.SphereGeometry(1.1, 64, 64);
+  var pos = geo.attributes.position;
+  for (var i = 0; i < pos.count; i++) {
+    var x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    var n1 = Math.sin(x * 3.1 + 1.7) * 0.08;
+    var n2 = Math.cos(y * 2.7 + 0.9) * 0.06;
+    var n3 = Math.sin(z * 4.3 + 2.3) * 0.05;
+    var len = Math.sqrt(x * x + y * y + z * z);
+    var s = 1 + n1 + n2 + n3;
+    pos.setXYZ(i, x / len * s, y / len * s * 0.92, z / len * s * 1.08);
+  }
+  geo.computeVertexNormals();
+
+  // 表皮纹理 512×512（更清晰）
+  _state.skinCanvas = makeCanvas(512, 512);
+  var sctx = _state.skinCtx = _state.skinCanvas.getContext('2d');
+  _drawSkin(sctx, 512, false);
+
+  _state.potatoSkin = new THREE.CanvasTexture(_state.skinCanvas);
+  _state.potatoSkin.colorSpace = THREE.SRGBColorSpace || THREE.SRGBEncoding;
+  _state.potatoSkin.anisotropy = 8;
+
+  var mat = new THREE.MeshStandardMaterial({
+    map: _state.potatoSkin,
+    roughness: 0.85,
+    metalness: 0.0
+  });
+
+  _state.potato = new THREE.Mesh(geo, mat);
+  _state.potato.scale.setScalar(1.0);
+  _state.potato.visible = false;
+  _state.scene.add(_state.potato);
+
+  // 果肉
+  var innerGeo = new THREE.SphereGeometry(1.05, 48, 48);
+  _state.potatoInner = new THREE.Mesh(innerGeo, new THREE.MeshStandardMaterial({ color: 0xF6E2AC, roughness: 0.7 }));
+  _state.potatoInner.scale.setScalar(1.0);
+  _state.potatoInner.visible = false;
+  _state.scene.add(_state.potatoInner);
+}
+
+function _drawSkin(sctx, SZ, golden) {
+  sctx.globalCompositeOperation = 'source-over';
+  sctx.clearRect(0, 0, SZ, SZ);
+
+  var g = sctx.createRadialGradient(SZ * 0.3, SZ * 0.3, 10, SZ / 2, SZ / 2, SZ * 0.75);
+  if (golden) {
+    g.addColorStop(0, '#F5D06B'); g.addColorStop(0.6, '#E2AC3F'); g.addColorStop(1, '#B97C1F');
+  } else {
+    g.addColorStop(0, '#C98F5B'); g.addColorStop(0.55, '#B0743E'); g.addColorStop(1, '#82501F');
+  }
+  sctx.fillStyle = g;
+  sctx.fillRect(0, 0, SZ, SZ);
+
+  for (var i = 0; i < 600; i++) {
+    var rx = Math.random() * SZ, ry = Math.random() * SZ, rs = 0.5 + Math.random() * 3;
+    sctx.beginPath(); sctx.arc(rx, ry, rs, 0, Math.PI * 2);
+    sctx.fillStyle = Math.random() > 0.5 ? 'rgba(255,235,190,0.15)' : 'rgba(70,38,12,0.2)';
+    sctx.fill();
+  }
+  var eyes = 8 + Math.floor(Math.random() * 6);
+  for (var e = 0; e < eyes; e++) {
+    var ex = Math.random() * SZ, ey = Math.random() * SZ, er = 2 + Math.random() * 5;
+    sctx.beginPath();
+    if (sctx.ellipse) sctx.ellipse(ex, ey, er * 1.3, er, Math.random() * 3, 0, Math.PI * 2);
+    else sctx.arc(ex, ey, er, 0, Math.PI * 2);
+    sctx.fillStyle = 'rgba(50,25,8,0.55)'; sctx.fill();
+  }
+  var hg = sctx.createRadialGradient(SZ * 0.2, SZ * 0.2, 4, SZ * 0.2, SZ * 0.2, SZ * 0.7);
+  hg.addColorStop(0, 'rgba(255,248,220,0.35)'); hg.addColorStop(1, 'rgba(255,248,220,0)');
+  sctx.fillStyle = hg; sctx.fillRect(0, 0, SZ, SZ);
+}
+
+// ============ 对外 API ============
+
+function getUICtx() { return _state.uictx; }
+function getUIWidth() { return _state.W; }
+function getUIHeight() { return _state.H; }
+function getUICanvas() { return _state.uiCanvas; }
+function getGlCanvas() { return _state.glCanvas; }
+
+function setPotatoVisible(v) {
+  _state.potatoVisible = !!v;
+  if (_state.potato) _state.potato.visible = v;
+  if (_state.potatoInner) _state.potatoInner.visible = v;
+  if (v) {
+    _drawSkin(_state.skinCtx, _state.skinCanvas.width, false);
+    _state.potatoSkin.needsUpdate = true;
+  }
+}
+
+function resetSkin(golden) {
+  _drawSkin(_state.skinCtx, _state.skinCanvas.width, !!golden);
+  _state.potatoSkin.needsUpdate = true;
+}
+
+// 设置工具：'knife' (削皮刀, 18px), 'fork' (叉子, 8px, 刮痕), 'grater' (刨丝器, 28px)
+function setTool(toolName) {
+  _state.tool = toolName || 'knife';
+  if (toolName === 'fork') _state.toolSize = 8;
+  else if (toolName === 'grater') _state.toolSize = 28;
+  else _state.toolSize = 18;
+}
+function getTool() { return _state.tool; }
+
+// 削皮：单段或连续轨迹
+// brushPx: UI 层绘制的笔刷屏幕像素
+function peelTrail(x1, y1, x2, y2, brushPx) {
+  if (!_state.potatoVisible || !_state.potato) return { peeled: false };
+
+  var dx = x2 - x1, dy = y2 - y1;
+  var dist = Math.sqrt(dx * dx + dy * dy);
+  var step = 3;
+  var steps = Math.max(1, Math.ceil(dist / step));
+  var peeled = false;
+  var hits = [];
+
+  for (var i = 0; i <= steps; i++) {
+    var t = i / steps;
+    var h = _hitPotato(x1 + dx * t, y1 + dy * t);
+    if (h) { peeled = true; hits.push(h); }
+  }
+
+  if (!peeled) return { peeled: false };
+
+  var sctx = _state.skinCtx;
+  var SZ = _state.skinCanvas.width;
+  var tool = _state.tool;
+  var baseBrush = brushPx || _state.toolSize;
+
+  if (tool === 'fork') {
+    // 叉子：细而深的刮痕（destination-in，在已削皮区域内再刮）
+    sctx.globalCompositeOperation = 'destination-out';
+    sctx.lineCap = 'round';
+    sctx.lineJoin = 'round';
+    for (var k = 0; k < 3; k++) { // 3 道叉齿
+      var offset = (k - 1) * 4; // 纹素偏移
+      if (hits.length >= 2) {
+        sctx.beginPath();
+        sctx.moveTo(hits[0].uvX * SZ, hits[0].uvY * SZ + offset);
+        for (var i2 = 1; i2 < hits.length; i2++) {
+          sctx.lineTo(hits[i2].uvX * SZ, hits[i2].uvY * SZ + offset);
+        }
+        sctx.lineWidth = 1.5;
+        sctx.stroke();
+      }
+    }
+  } else if (tool === 'grater') {
+    // 刨丝器：大面积擦除
+    sctx.globalCompositeOperation = 'destination-out';
+    sctx.lineCap = 'round';
+    sctx.lineJoin = 'round';
+    // 主擦除
+    if (hits.length >= 2) {
+      sctx.beginPath();
+      sctx.moveTo(hits[0].uvX * SZ, hits[0].uvY * SZ);
+      for (var i3 = 1; i3 < hits.length; i3++) {
+        sctx.lineTo(hits[i3].uvX * SZ, hits[i3].uvY * SZ);
+      }
+      sctx.lineWidth = baseBrush * 2.2;
+      sctx.stroke();
+    }
+    // 刨出来的细碎纹理（destination-in 在已削皮区域内画细条纹）
+    sctx.globalCompositeOperation = 'destination-out';
+    for (var g = 0; g < hits.length; g += 2) {
+      var hh = hits[g];
+      sctx.beginPath();
+      sctx.arc(hh.uvX * SZ + (Math.random() - 0.5) * 4, hh.uvY * SZ + (Math.random() - 0.5) * 4, 2 + Math.random() * 2, 0, Math.PI * 2);
+      sctx.fill();
+    }
+  } else {
+    // 削皮刀：圆润笔刷
+    sctx.globalCompositeOperation = 'destination-out';
+    sctx.lineCap = 'round';
+    sctx.lineJoin = 'round';
+    if (hits.length >= 2) {
+      sctx.beginPath();
+      sctx.moveTo(hits[0].uvX * SZ, hits[0].uvY * SZ);
+      for (var i4 = 1; i4 < hits.length; i4++) {
+        sctx.lineTo(hits[i4].uvX * SZ, hits[i4].uvY * SZ);
+      }
+      sctx.lineWidth = baseBrush * 1.8;
+      sctx.stroke();
+    }
+    for (var j = 0; j < hits.length; j += 3) {
+      sctx.beginPath();
+      sctx.arc(hits[j].uvX * SZ, hits[j].uvY * SZ, baseBrush * 0.9, 0, Math.PI * 2);
+      sctx.fill();
+    }
+  }
+
+  _state.potatoSkin.needsUpdate = true;
+  return { peeled: true };
+}
+
+function _hitPotato(xPx, yPx) {
+  var THREE = _state.THREE;
+  // UI 层是 dpr 倍物理像素，WebGL 也是 dpr 倍
+  // 但 Raycaster 的 NDC 归一化是 -1~1，用逻辑坐标就行
+  _state.pointer.x = (xPx / _state.W) * 2 - 1;
+  _state.pointer.y = -(yPx / _state.H) * 2 + 1;
+  _state.raycaster.setFromCamera(_state.pointer, _state.camera);
+  var hits = _state.raycaster.intersectObject(_state.potato, false);
+  if (!hits.length) return null;
+  var hit = hits[0];
+  if (!hit.uv) return null;
+  return { uvX: hit.uv.x, uvY: 1 - hit.uv.y, point: hit.point };
+}
+
+// 旋转到指定角度（切场景动画用）
+function orbitTo(theta, phi) {
+  _state.orbiter.theta = theta;
+  _state.orbiter.phi = clamp(phi, _state.orbiter.minPhi, _state.orbiter.maxPhi);
+  _updateOrbiterCamera();
+}
+
+// 渲染循环
+function render(t, dt) {
+  if (!_state.initialized) return;
+
+  // 3D 层
+  _state.renderer.autoClear = true;
+  _state.renderer.render(_state.scene, _state.camera);
+
+  // UI 层（不清除深度，用 UI quad 全屏覆盖）
+  _state.renderer.autoClear = false;
+  _state.renderer.clearDepth();
+  _state.uiTexture.needsUpdate = true;
+  _state.renderer.render(_state.uiScene, _state.uiCam);
+}
+
+function setClearColor(hex, alpha) {
+  if (!_state.renderer) return;
+  _state.renderer.setClearColor(hex != null ? hex : 0x2a1a10, alpha != null ? alpha : 1);
+}
+
+function setPeelPaused(paused) { _state.peelPaused = !!paused; }
+
+function dispose() {
+  if (_state.potato) { _state.scene.remove(_state.potato); _state.potato.geometry.dispose(); _state.potato.material.dispose(); _state.potato = null; }
+  if (_state.potatoInner) { _state.scene.remove(_state.potatoInner); _state.potatoInner.geometry.dispose(); _state.potatoInner.material.dispose(); _state.potatoInner = null; }
+  if (_state.renderer) { _state.renderer.dispose(); _state.renderer = null; }
+  _state.initialized = false;
+}
+
+module.exports = {
+  init: init,
+  getUICtx: getUICtx,
+  getUIWidth: getUIWidth,
+  getUIHeight: getUIHeight,
+  getUICanvas: getUICanvas,
+  getGlCanvas: getGlCanvas,
+  setPotatoVisible: setPotatoVisible,
+  resetSkin: resetSkin,
+  setTool: setTool,
+  getTool: getTool,
+  peelTrail: peelTrail,
+  orbitTo: orbitTo,
+  setClearColor: setClearColor,
+  setPeelPaused: setPeelPaused,
+  render: render,
+  dispose: dispose
+};
 
 };
 __defs["three-loader"] = function(module, exports, require){
@@ -35151,6 +32610,3277 @@ three-platformize/build/three.module.js:
    * SPDX-License-Identifier: MIT
    *)
 */
+
+};
+__defs["scenes/menu"] = function(module, exports, require){
+/**
+ * 大厅：订单入口、军需商店、每日补给、任务、自动削皮机、广告位。
+ */
+var CONFIG = require('../config');
+var Platform = require('../platform');
+var Economy = require('../economy');
+var Ads = require('../ads');
+var Sound = require('../audio');
+var UI = require('../ui');
+var T = UI.T;
+var ShopOverlay = require('./shop');
+var DailyOverlay = require('./daily');
+var SettingsOverlay = require('./settings');
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+var TIPS = [
+  '削薄一点，别浪费。',
+  '军需官说：今天也要削满一桶。',
+  '刀越快，皮越薄。',
+  '反复刮同一处，果肉会哭。',
+  '机器会记得你削过的每一颗土豆。'
+];
+
+function MenuScene(main) {
+  this.main = main;
+  this.t = 0;
+  this.overlay = null;
+  this.active = null;
+  this.tip = TIPS[0];
+  this.tipT = 0;
+  this.coinShown = 0;
+  this.layout();
+}
+
+MenuScene.prototype.layout = function () {
+  var main = this.main;
+  var W = main.W;
+  var H = main.H;
+  var st = Platform.safeTop;
+  var sb = Platform.safeBottom;
+  this.W = W;
+  this.H = H;
+  this.safeTop = st;
+  this.safeBottom = sb;
+
+  this.titleY = st + clamp(H * 0.105, 60, 92);
+  this.titleSize = clamp(W * 0.108, 30, 44);
+  this.titleY = st + clamp(H * 0.105, 60, 92);
+  var titleMin = st + 60 + this.titleSize * 0.55;
+  if (this.titleY < titleMin) this.titleY = titleMin;
+  this.mascotY = this.titleY + clamp(H * 0.125, 76, 132);
+  this.mascotR = clamp(W * 0.125, 36, 52);
+
+  this.cardX = 18;
+  this.cardW = W - 36;
+  this.cardH = H < 700 ? 150 : (H > 800 ? 176 : 160);
+  this.cardY = this.mascotY + clamp(H * 0.10, 72, 112);
+  this.rowY = this.cardY + this.cardH + 12;
+  this.rowH = 60;
+  this.tileGap = 9;
+  this.tileW = (this.cardW - this.tileGap * 2) / 3;
+
+  this.bannerY = H - sb - 56;
+  this.idleH = 54;
+  this.idleY = this.bannerY - this.idleH - 10;
+  this.pileTop = this.rowY + this.rowH + 10;
+  this.pileBottom = this.idleY - 8;
+
+  this.refresh();
+};
+
+MenuScene.prototype.enter = function () {
+  Economy.refresh();
+  Economy.updateIdle();
+  Ads.showBanner();
+  this.coinShown = Economy.s.coins;
+  this.refresh();
+};
+
+MenuScene.prototype.onHide = function () {
+  Economy.save();
+};
+
+MenuScene.prototype.refresh = function () {
+  var main = this.main;
+  var W = this.W;
+  var st = this.safeTop;
+  var order = Economy.nextOrder();
+  var daily = Economy.dailyInfo();
+  var quests = Economy.questList();
+  var claimable = 0;
+  for (var i = 0; i < quests.length; i++) if (quests[i].canClaim) claimable++;
+  this.order = order;
+  this.daily = daily;
+  this.questClaimable = claimable;
+  this.idle = Economy.idleInfo();
+
+  var areas = [];
+  function add(o) { areas.push(o); return o; }
+
+  add({ x: 16, y: st + 10, w: 42, h: 42, action: 'sound' });
+  add({ x: 64, y: st + 10, w: 42, h: 42, action: 'settings' });
+  add({ x: W - 16 - 118 - 46, y: st + 10, w: 42, h: 42, action: 'share' });
+  add({ x: W - 16 - 118, y: st + 12, w: 118, h: 38, action: 'coins' });
+  add({ x: this.cardX + 14, y: this.cardY + this.cardH - 56, w: this.cardW - 28, h: 46, action: 'play', pressed: false });
+
+  for (var k = 0; k < 3; k++) {
+    add({
+      x: this.cardX + k * (this.tileW + this.tileGap),
+      y: this.rowY,
+      w: this.tileW,
+      h: this.rowH,
+      action: k === 0 ? 'shop' : k === 1 ? 'daily' : 'tasks',
+      pressed: false
+    });
+  }
+
+  if (this.idle.rate > 0 && this.idle.pending >= 1) {
+    add({ x: W - 18 - 122, y: this.idleY + 10, w: 56, h: 34, action: 'idleCollect', pressed: false });
+    add({ x: W - 18 - 62, y: this.idleY + 10, w: 62, h: 34, action: 'idleDouble', pressed: false });
+  } else {
+    add({ x: W - 18 - 86, y: this.idleY + 10, w: 86, h: 34, action: 'idleGo', pressed: false });
+  }
+
+  this.areas = areas;
+};
+
+MenuScene.prototype.update = function (dt) {
+  this.t += dt;
+  this.tipT += dt;
+  if (this.tipT > 4.5) {
+    this.tipT = 0;
+    this.tip = TIPS[Math.floor(Math.random() * TIPS.length)];
+  }
+  var target = Economy.s.coins;
+  this.coinShown += (target - this.coinShown) * Math.min(1, dt * 10);
+  if (Math.abs(target - this.coinShown) < 0.6) this.coinShown = target;
+  if (this.overlay && this.overlay.update) this.overlay.update(dt);
+};
+
+MenuScene.prototype.render = function (ctx) {
+  var W = this.W;
+  var H = this.H;
+  var t = this.t;
+
+  this.drawBackground(ctx, t);
+  this.drawTopBar(ctx);
+  this.drawTitle(ctx);
+  this.drawMascot(ctx, t);
+  this.drawOrderCard(ctx, t);
+  this.drawTiles(ctx);
+  this.drawPile(ctx, t);
+  this.drawIdleBar(ctx);
+  this.drawBanner(ctx);
+
+  if (this.overlay) this.overlay.render(ctx);
+};
+
+MenuScene.prototype.drawBackground = function (ctx, t) {
+  var W = this.W;
+  var H = this.H;
+  var wallH = H * 0.63;
+
+  var bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#FBEDD0');
+  bg.addColorStop(0.62, '#F2DFBA');
+  bg.addColorStop(1, '#DDBE8B');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // 瓷砖墙
+  ctx.save();
+  ctx.globalAlpha = 0.5;
+  ctx.strokeStyle = '#E2C99F';
+  ctx.lineWidth = 1;
+  var tile = Math.max(38, W / 9);
+  for (var x = 0; x < W; x += tile) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, wallH);
+    ctx.stroke();
+  }
+  for (var y = 0; y < wallH; y += tile) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(W, y);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // 灯光
+  var lg = ctx.createRadialGradient(W * 0.5, H * 0.2, 10, W * 0.5, H * 0.2, W * 0.75);
+  lg.addColorStop(0, 'rgba(255,248,220,0.55)');
+  lg.addColorStop(1, 'rgba(255,248,220,0)');
+  ctx.fillStyle = lg;
+  ctx.fillRect(0, 0, W, H);
+
+  // 台面
+  var cg = ctx.createLinearGradient(0, wallH, 0, H);
+  cg.addColorStop(0, '#C99159');
+  cg.addColorStop(0.12, '#B57C46');
+  cg.addColorStop(1, '#8E5B2D');
+  ctx.fillStyle = cg;
+  ctx.fillRect(0, wallH, W, H - wallH);
+  ctx.fillStyle = 'rgba(255,236,200,0.28)';
+  ctx.fillRect(0, wallH, W, 2);
+
+  // 木纹
+  ctx.save();
+  ctx.globalAlpha = 0.13;
+  ctx.strokeStyle = '#5E3A18';
+  ctx.lineWidth = 1.4;
+  for (var i = 0; i < 7; i++) {
+    var yy = wallH + 26 + i * 36;
+    ctx.beginPath();
+    ctx.moveTo(0, yy);
+    ctx.bezierCurveTo(W * 0.3, yy - 4, W * 0.6, yy + 6, W, yy - 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+};
+
+MenuScene.prototype.drawTopBar = function (ctx) {
+  var W = this.W;
+  var st = this.safeTop;
+  var sound = Economy.s.settings.sound;
+  UI.button(ctx, UI.makeButton({
+    x: 16, y: st + 10, w: 42, h: 42, kind: 'icon', radius: 13,
+    icon: sound ? 'sound' : 'soundOff', iconSize: 22, active: false
+  }));
+  UI.button(ctx, UI.makeButton({
+    x: 64, y: st + 10, w: 42, h: 42, kind: 'icon', radius: 13, icon: 'gear', iconSize: 22
+  }));
+  UI.button(ctx, UI.makeButton({
+    x: W - 16 - 118 - 46, y: st + 10, w: 42, h: 42, kind: 'icon', radius: 13, icon: 'share', iconSize: 19
+  }));
+
+  var pillW = 118;
+  var pillX = W - 16 - pillW;
+  UI.pill(ctx, pillX, st + 12, pillW, 38, 'rgba(255,248,232,0.95)', 'rgba(150,103,52,0.32)');
+  UI.drawCoin(ctx, pillX + 20, st + 31, 11);
+  UI.text(ctx, String(Math.round(this.coinShown)), pillX + pillW - 12, st + 31, 16, T.ink, 'right', 800);
+};
+
+MenuScene.prototype.drawTitle = function (ctx) {
+  var W = this.W;
+  var y = this.titleY;
+  var size = this.titleSize;
+  ctx.save();
+  ctx.translate(W / 2, y);
+  ctx.rotate(-0.018);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = UI.font(size, 900);
+  ctx.lineWidth = 8;
+  ctx.strokeStyle = 'rgba(255,248,230,0.9)';
+  ctx.strokeText('土豆削削乐', 0, 0);
+  var g = ctx.createLinearGradient(0, -size * 0.6, 0, size * 0.6);
+  g.addColorStop(0, '#7A4A22');
+  g.addColorStop(1, '#4A2E19');
+  ctx.fillStyle = g;
+  ctx.fillText('土豆削削乐', 0, 0);
+  ctx.restore();
+
+  if (this.mascotY - this.titleY > 112) {
+    UI.text(ctx, this.tip, W / 2, y + size * 0.68 + 6, 11, 'rgba(126,90,56,0.95)', 'center', 600);
+  }
+};
+
+MenuScene.prototype.drawMascot = function (ctx, t) {
+  var W = this.W;
+  var cx = W / 2;
+  var cy = this.mascotY - 6 + Math.sin(t * 2.1) * 4;
+  var r = this.mascotR;
+
+  // 影子
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(cx, cy + r * 1.05, r * 0.78, r * 0.16, 0, 0, Math.PI * 2) : ctx.arc(cx, cy + r, r * 0.3, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(70,40,15,0.16)';
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(Math.sin(t * 1.4) * 0.03);
+
+  // 土豆身体
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.98, 0);
+  ctx.bezierCurveTo(-r * 0.98, -r * 0.82, -r * 0.5, -r * 1.02, r * 0.04, -r * 0.98);
+  ctx.bezierCurveTo(r * 0.68, -r * 0.94, r * 1.02, -r * 0.5, r * 0.98, r * 0.08);
+  ctx.bezierCurveTo(r * 0.94, r * 0.66, r * 0.48, r * 1.02, -r * 0.08, r * 0.98);
+  ctx.bezierCurveTo(-r * 0.64, r * 0.94, -r * 0.98, r * 0.58, -r * 0.98, 0);
+  ctx.closePath();
+  var bg = ctx.createRadialGradient(-r * 0.3, -r * 0.4, r * 0.1, 0, 0, r * 1.3);
+  bg.addColorStop(0, '#D6A06C');
+  bg.addColorStop(0.6, '#B87A42');
+  bg.addColorStop(1, '#8A5326');
+  ctx.fillStyle = bg;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(80,45,18,0.35)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // 削开的果肉（左下角小片，避免像大嘴）
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.9, r * 0.3);
+  ctx.quadraticCurveTo(-r * 0.66, r * 0.82, -r * 0.16, r * 0.74);
+  ctx.quadraticCurveTo(-r * 0.42, r * 0.52, -r * 0.9, r * 0.3);
+  ctx.closePath();
+  var fg = ctx.createLinearGradient(0, r * 0.2, 0, r * 0.9);
+  fg.addColorStop(0, '#FFF2CC');
+  fg.addColorStop(1, '#EDCF90');
+  ctx.fillStyle = fg;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(150,104,45,0.35)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+
+  // 眼睛
+  ctx.beginPath();
+  ctx.arc(-r * 0.3, -r * 0.18, r * 0.075, 0, Math.PI * 2);
+  ctx.arc(r * 0.26, -r * 0.2, r * 0.075, 0, Math.PI * 2);
+  ctx.fillStyle = '#3F2715';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(-r * 0.28, -r * 0.21, r * 0.026, 0, Math.PI * 2);
+  ctx.arc(r * 0.28, -r * 0.23, r * 0.026, 0, Math.PI * 2);
+  ctx.fillStyle = '#FFF9E8';
+  ctx.fill();
+
+  // 微笑
+  ctx.beginPath();
+  ctx.arc(0, -r * 0.02, r * 0.16, 0.25, Math.PI - 0.25);
+  ctx.strokeStyle = '#4A2E19';
+  ctx.lineWidth = 2.2;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  // 腮红
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(-r * 0.52, r * 0.02, r * 0.1, r * 0.06, 0, 0, Math.PI * 2) :
+    ctx.arc(-r * 0.52, r * 0.02, r * 0.07, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(214,105,79,0.35)';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(r * 0.46, r * 0.0, r * 0.1, r * 0.06, 0, 0, Math.PI * 2) :
+    ctx.arc(r * 0.46, 0, r * 0.07, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 小芽
+  ctx.beginPath();
+  ctx.moveTo(r * 0.02, -r * 0.97);
+  ctx.quadraticCurveTo(r * 0.06, -r * 1.14, r * 0.2, -r * 1.18);
+  ctx.strokeStyle = '#5E8B45';
+  ctx.lineWidth = 2.2;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(r * 0.25, -r * 1.19, r * 0.1, r * 0.055, -0.5, 0, Math.PI * 2) :
+    ctx.arc(r * 0.23, -r * 1.18, r * 0.075, 0, Math.PI * 2);
+  ctx.fillStyle = '#7FB069';
+  ctx.fill();
+
+  // 小刀
+  ctx.save();
+  ctx.translate(r * 1.12, r * 0.12);
+  ctx.rotate(-0.45 + Math.sin(t * 2.2) * 0.04);
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.1, r * 0.34);
+  ctx.quadraticCurveTo(-r * 0.02, -r * 0.32, r * 0.36, -r * 0.12);
+  ctx.lineTo(r * 0.12, r * 0.2);
+  ctx.closePath();
+  ctx.fillStyle = '#E4EBF0';
+  ctx.fill();
+  ctx.strokeStyle = '#7B8794';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.12, r * 0.32);
+  ctx.lineTo(-r * 0.26, r * 0.46);
+  ctx.strokeStyle = '#7A4A22';
+  ctx.lineWidth = 5;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.restore();
+
+  // 飘着的皮
+  var pt = (t * 0.6) % 1;
+  ctx.save();
+  ctx.globalAlpha = 0.55 * (1 - pt);
+  ctx.strokeStyle = '#B0743E';
+  ctx.lineWidth = 2.2;
+  ctx.beginPath();
+  ctx.arc(cx - r * 0.95 - pt * 20, cy + r * 0.3 - pt * 26, 5, 0.4, 2.6);
+  ctx.stroke();
+  ctx.restore();
+};
+
+MenuScene.prototype.drawOrderCard = function (ctx, t) {
+  var o = this.order;
+  var x = this.cardX;
+  var y = this.cardY;
+  var w = this.cardW;
+  var h = this.cardH;
+
+  ctx.save();
+  UI.shadow(ctx, 'rgba(90,55,22,0.22)', 18, 0, 8);
+  UI.fillRR(ctx, x, y, w, h, 20, '#FFF8E8');
+  UI.clearShadow(ctx);
+  UI.strokeRR(ctx, x, y, w, h, 20, 'rgba(150,103,52,0.28)', 1.5);
+
+  UI.fillRR(ctx, x + 16, y + 14, 78, 24, 12, 'rgba(111,168,94,0.16)');
+  UI.text(ctx, '军需订单', x + 55, y + 26, 11.5, T.greenDark, 'center', 800);
+  UI.text(ctx, '#' + o.index, x + w - 18, y + 26, 12, T.inkSoft, 'right', 800);
+
+  UI.text(ctx, '土豆 × ' + o.count, x + 18, y + 56, 28, T.ink, 'left', 900);
+  var targetLine = '目标削净 ' + Math.round(o.target * 100) + '% · 限时 ' + o.timeLimit + 's';
+  if (o.goldenIndex >= 0 && h < 166) targetLine += ' · 金土豆★';
+  UI.text(ctx, targetLine, x + 18, y + (h < 166 ? 82 : 84), 12, T.inkSoft, 'left', 600);
+
+  // 收益
+  var coinX = x + w - 66;
+  UI.drawCoin(ctx, coinX, y + 58, 13, true);
+  UI.text(ctx, '+' + o.baseCoins, x + w - 46, y + 58, 22, T.goldDark, 'left', 900);
+  UI.text(ctx, '基础收益', x + w - 18, y + 80, 10, T.inkSoft, 'right', 600);
+
+  if (o.goldenIndex >= 0 && h >= 166) {
+    UI.pill(ctx, x + 18, y + 93, 82, 20, 'rgba(242,184,75,0.2)');
+    UI.drawIcon(ctx, 'star', x + 30, y + 103, 12, T.gold);
+    UI.text(ctx, '金土豆订单', x + 62, y + 103, 10, T.goldDark, 'center', 800);
+  }
+
+  var btn = UI.makeButton({
+    x: x + 14, y: y + h - 56, w: w - 28, h: 46, radius: 15,
+    label: '开 始 削 皮', kind: 'primary', size: 19
+  });
+  btn.pressed = this.isPressed('play');
+  UI.button(ctx, btn);
+  ctx.restore();
+};
+
+MenuScene.prototype.drawTiles = function (ctx) {
+  var tiles = [
+    { action: 'shop', icon: 'shop', label: '军需商店', sub: '升级装备' },
+    { action: 'daily', icon: 'calendar', label: '每日补给', sub: this.daily.claimedToday ? '已领取' : '可领取' },
+    { action: 'tasks', icon: 'star', label: '今日任务', sub: this.questClaimable > 0 ? this.questClaimable + ' 个可领' : '进行中' }
+  ];
+  for (var i = 0; i < tiles.length; i++) {
+    var it = tiles[i];
+    var x = this.cardX + i * (this.tileW + this.tileGap);
+    var y = this.rowY + (this.isPressed(it.action) ? 2 : 0);
+    var w = this.tileW;
+    var h = this.rowH;
+
+    UI.fillRR(ctx, x, y + 3, w, h, 16, 'rgba(122,78,32,0.18)');
+    UI.fillRR(ctx, x, y, w, h, 16, '#FFF7E6');
+    UI.strokeRR(ctx, x, y, w, h, 16, 'rgba(150,103,52,0.26)', 1);
+    UI.drawIcon(ctx, it.icon, x + w / 2, y + 20, 20, T.ink);
+    UI.text(ctx, it.label, x + w / 2, y + 40, 11.5, T.ink, 'center', 800);
+    UI.text(ctx, it.sub, x + w / 2, y + 52, 9, T.inkSoft, 'center', 600);
+
+    if (it.action === 'daily' && !this.daily.claimedToday) {
+      ctx.beginPath();
+      ctx.arc(x + w - 10, y + 10, 5, 0, Math.PI * 2);
+      ctx.fillStyle = T.red;
+      ctx.fill();
+    }
+    if (it.action === 'tasks' && this.questClaimable > 0) {
+      ctx.beginPath();
+      ctx.arc(x + w - 10, y + 10, 8, 0, Math.PI * 2);
+      ctx.fillStyle = T.red;
+      ctx.fill();
+      UI.text(ctx, String(this.questClaimable), x + w - 10, y + 10, 9, '#FFF', 'center', 800);
+    }
+  }
+};
+
+MenuScene.prototype.drawPile = function (ctx, t) {
+  var top = this.pileTop;
+  var bottom = this.pileBottom;
+  var avail = bottom - top;
+  if (avail < 105) {
+    if (avail < 34) return;
+    var stats = '已削 ' + Economy.s.potatoesPeeled + ' 颗 · S 评级 ' + Economy.s.sGrades + ' · 最佳订单 #' + Economy.s.bestOrder;
+    var sw = Math.min(this.W - 60, UI.measure(ctx, stats, 10, 700) + 40);
+    var sy = (top + bottom) / 2 - 17;
+    UI.pill(ctx, (this.W - sw) / 2, sy, sw, 34, 'rgba(255,248,232,0.6)', 'rgba(150,103,52,0.2)');
+    UI.text(ctx, stats, this.W / 2, sy + 17, 10, 'rgba(94,58,28,0.65)', 'center', 700);
+    return;
+  }
+  var W = this.W;
+  var s = Math.max(0.62, Math.min(1, avail / 205));
+  var cx = W * 0.5;
+  var baseY = bottom - 8;
+  var bw = 132 * s;
+  var bh = 80 * s;
+
+  ctx.save();
+  // 背后的暖光
+  var glow = ctx.createRadialGradient(cx, top + avail * 0.55, 6, cx, top + avail * 0.55, 120 * s);
+  glow.addColorStop(0, 'rgba(255,244,210,0.5)');
+  glow.addColorStop(1, 'rgba(255,244,210,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(cx - 140 * s, top, 280 * s, avail);
+
+  var headText = '累计削皮 ' + Economy.s.potatoesPeeled + ' 颗';
+  var headW = Math.max(112, Math.min(158, UI.measure(ctx, headText, 9.5, 600) + 34));
+  UI.pill(ctx, cx - headW / 2, top + 3, headW, 40, 'rgba(255,248,232,0.62)');
+  UI.text(ctx, '土 豆 山', cx, top + 14, 13, 'rgba(94,58,28,0.66)', 'center', 900);
+  UI.text(ctx, headText, cx, top + 31, 9.5, 'rgba(94,58,28,0.5)', 'center', 600);
+
+  // 堆叠的土豆
+  var rows = [
+    { n: 5, y: -7, sp: 27 },
+    { n: 4, y: -27, sp: 28 },
+    { n: 3, y: -46, sp: 29 },
+    { n: 2, y: -64, sp: 30 }
+  ];
+  for (var r = 0; r < rows.length; r++) {
+    var row = rows[r];
+    for (var i = 0; i < row.n; i++) {
+      var off = (i - (row.n - 1) / 2) * row.sp * s;
+      var px = cx + off;
+      var py = baseY - bh + row.y * s;
+      var rx = 20 * s * (0.94 + (i % 2) * 0.08);
+      var ry = 15 * s;
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate((i % 3 - 1) * 0.12);
+      ctx.beginPath();
+      ctx.ellipse ? ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2) : ctx.arc(0, 0, rx, 0, Math.PI * 2);
+      var pg = ctx.createRadialGradient(-rx * 0.3, -ry * 0.35, 1, 0, 0, rx);
+      pg.addColorStop(0, '#CE9A63');
+      pg.addColorStop(0.65, '#B0743E');
+      pg.addColorStop(1, '#84501F');
+      ctx.fillStyle = pg;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse ? ctx.ellipse(-rx * 0.34, -ry * 0.36, rx * 0.22, ry * 0.24, 0, 0, Math.PI * 2) :
+        ctx.arc(-rx * 0.3, -ry * 0.3, rx * 0.2, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,235,190,0.4)';
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // 木桶
+  ctx.beginPath();
+  ctx.moveTo(cx - bw / 2, baseY - bh);
+  ctx.lineTo(cx + bw / 2, baseY - bh);
+  ctx.lineTo(cx + bw * 0.38, baseY);
+  ctx.lineTo(cx - bw * 0.38, baseY);
+  ctx.closePath();
+  var bg = ctx.createLinearGradient(cx - bw / 2, 0, cx + bw / 2, 0);
+  bg.addColorStop(0, '#8E5B2D');
+  bg.addColorStop(0.35, '#C08A50');
+  bg.addColorStop(0.7, '#A9743C');
+  bg.addColorStop(1, '#7A4A22');
+  ctx.fillStyle = bg;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(70,40,15,0.35)';
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+
+  // 水
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(cx, baseY - bh + 2, bw * 0.44, 8 * s, 0, 0, Math.PI * 2) :
+    ctx.arc(cx, baseY - bh + 2, bw * 0.4, 0, Math.PI * 2);
+  ctx.fillStyle = '#7FA9B6';
+  ctx.fill();
+  ctx.strokeStyle = '#D8E8EA';
+  ctx.lineWidth = 2 * s;
+  ctx.stroke();
+
+  // 桶沿
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(cx, baseY - bh, bw * 0.5, 9 * s, 0, 0, Math.PI * 2) :
+    ctx.arc(cx, baseY - bh, bw * 0.48, 0, Math.PI * 2);
+  ctx.strokeStyle = '#6E4520';
+  ctx.lineWidth = 5 * s;
+  ctx.stroke();
+
+  // 桶箍
+  ctx.beginPath();
+  ctx.moveTo(cx - bw * 0.47, baseY - bh * 0.62);
+  ctx.lineTo(cx + bw * 0.47, baseY - bh * 0.62);
+  ctx.strokeStyle = 'rgba(90,55,25,0.45)';
+  ctx.lineWidth = 5 * s;
+  ctx.stroke();
+
+  // 削好的土豆
+  for (var k = 0; k < 3; k++) {
+    var px2 = cx + (k - 1) * 18 * s;
+    var py2 = baseY - bh + 1 + (k % 2) * 3 * s;
+    ctx.beginPath();
+    ctx.ellipse ? ctx.ellipse(px2, py2, 11 * s, 7 * s, 0.2, 0, Math.PI * 2) :
+      ctx.arc(px2, py2, 9 * s, 0, Math.PI * 2);
+    ctx.fillStyle = '#F8E6B4';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(150,104,45,0.35)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // 热气
+  for (var m = 0; m < 2; m++) {
+    var rise = (t * 0.35 + m * 0.5) % 1;
+    ctx.beginPath();
+    ctx.globalAlpha = 0.18 * (1 - rise);
+    ctx.strokeStyle = '#FFF8E0';
+    ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    ctx.moveTo(cx + (m ? 18 : -14) * s, baseY - bh - 8 - rise * 28);
+    ctx.quadraticCurveTo(cx + (m ? 30 : -26) * s, baseY - bh - 22 - rise * 32, cx + (m ? 16 : -12) * s, baseY - bh - 38 - rise * 36);
+    ctx.stroke();
+  }
+  ctx.restore();
+};
+
+MenuScene.prototype.drawIdleBar = function (ctx) {
+  var W = this.W;
+  var x = 18;
+  var y = this.idleY;
+  var w = W - 36;
+  var h = this.idleH;
+  var info = this.idle;
+
+  UI.fillRR(ctx, x, y, w, h, 16, 'rgba(255,248,232,0.94)');
+  UI.strokeRR(ctx, x, y, w, h, 16, info.rate > 0 ? 'rgba(242,184,75,0.65)' : 'rgba(150,103,52,0.24)', 1.5);
+  UI.drawIcon(ctx, 'machine', x + 28, y + h / 2, 22, info.rate > 0 ? T.goldDark : T.inkSoft);
+
+  if (info.rate > 0) {
+    UI.text(ctx, '自动削皮机', x + 50, y + 18, 11, T.inkSoft, 'left', 700);
+    if (info.pending >= 1) {
+      UI.text(ctx, '+' + info.pending + ' 待收取', x + 50, y + 36, 14, T.goldDark, 'left', 900);
+    } else {
+      UI.text(ctx, '运转中 · ' + info.rate + ' 币/分', x + 50, y + 36, 12, T.ink, 'left', 700);
+    }
+  } else {
+    UI.text(ctx, '自动削皮机未解锁', x + 50, y + 19, 12, T.ink, 'left', 800);
+    UI.text(ctx, '离线也能替你攒土豆币', x + 50, y + 35, 10, T.inkSoft, 'left', 600);
+  }
+
+  if (info.rate > 0 && info.pending >= 1) {
+    var b1 = UI.makeButton({
+      x: W - 18 - 122, y: y + 10, w: 56, h: 34, radius: 12,
+      label: '领取', kind: 'secondary', size: 12
+    });
+    var b2 = UI.makeButton({
+      x: W - 18 - 62, y: y + 10, w: 62, h: 34, radius: 12,
+      label: '视频×2', kind: 'gold', size: 11
+    });
+    b1.pressed = this.isPressed('idleCollect');
+    b2.pressed = this.isPressed('idleDouble');
+    UI.button(ctx, b1);
+    UI.button(ctx, b2);
+  } else {
+    var b3 = UI.makeButton({
+      x: W - 18 - 86, y: y + 10, w: 86, h: 34, radius: 12,
+      label: info.rate > 0 ? '运转中' : '去解锁', kind: info.rate > 0 ? 'secondary' : 'primary', size: 11.5
+    });
+    b3.pressed = this.isPressed('idleGo');
+    b3.enabled = true;
+    UI.button(ctx, b3);
+  }
+};
+
+MenuScene.prototype.drawBanner = function (ctx) {
+  if (!Ads.isDemo() || !CONFIG.ads.demoAds) return;
+  var W = this.W;
+  var y = this.bannerY;
+  ctx.save();
+  ctx.setLineDash ? ctx.setLineDash([5, 4]) : null;
+  UI.strokeRR(ctx, 18, y, W - 36, 46, 10, 'rgba(126,90,56,0.28)', 1);
+  if (ctx.setLineDash) ctx.setLineDash([]);
+  UI.text(ctx, 'Banner 广告位 · 微信流量主接入后展示', W / 2, y + 23, 9.5, 'rgba(126,90,56,0.65)', 'center', 600);
+  ctx.restore();
+};
+
+MenuScene.prototype.isPressed = function (action) {
+  return this.active && this.active.action === action;
+};
+
+MenuScene.prototype.onDown = function (p) {
+  if (this.overlay) {
+    if (this.overlay.onDown) this.overlay.onDown(p);
+    return;
+  }
+  var a = this.hitAt(p.x, p.y);
+  if (a) {
+    this.active = a;
+    Sound.tap();
+  }
+};
+
+MenuScene.prototype.onMove = function (p) {
+  if (this.overlay && this.overlay.onMove) this.overlay.onMove(p);
+};
+
+MenuScene.prototype.onUp = function (p) {
+  if (this.overlay) {
+    if (this.overlay.onUp) this.overlay.onUp(p);
+    if (this.overlay && this.overlay.closed) {
+      this.overlay = null;
+      Ads.showBanner();
+      Economy.refresh();
+      this.refresh();
+    }
+    return;
+  }
+  var a = this.active;
+  this.active = null;
+  if (!a) return;
+  if (!UI.hit(a, p.x, p.y)) return;
+  this.activate(a.action);
+};
+
+MenuScene.prototype.hitAt = function (x, y) {
+  for (var i = this.areas.length - 1; i >= 0; i--) {
+    if (UI.hit(this.areas[i], x, y)) return this.areas[i];
+  }
+  return null;
+};
+
+MenuScene.prototype.activate = function (action) {
+  var self = this;
+  if (action === 'play') {
+    Platform.haptic('medium');
+    this.main.startOrder();
+  } else if (action === 'sound') {
+    var on = !Economy.s.settings.sound;
+    Economy.setSetting('sound', on);
+    Sound.setMuted(!on);
+    if (on) Sound.tap();
+    this.main.notify(on ? '音效已开启' : '音效已关闭');
+  } else if (action === 'settings') {
+    this.openOverlay(new SettingsOverlay(this.main, function () { self.closeOverlay(); }));
+  } else if (action === 'share') {
+    this.main.shareGame();
+  } else if (action === 'shop') {
+    this.openOverlay(new ShopOverlay(this.main, function () { self.closeOverlay(); }));
+  } else if (action === 'daily') {
+    this.openOverlay(new DailyOverlay(this.main, 'daily', function () { self.closeOverlay(); }));
+  } else if (action === 'tasks') {
+    this.openOverlay(new DailyOverlay(this.main, 'tasks', function () { self.closeOverlay(); }));
+  } else if (action === 'idleCollect') {
+    var r = Economy.collectIdle(false);
+    if (r.ok) {
+      Sound.coin();
+      this.main.notify('已收取 ' + r.coins + ' 土豆币');
+      this.refresh();
+    }
+  } else if (action === 'idleDouble') {
+    var rr = Economy.collectIdle(true);
+    if (rr.ok) {
+      Sound.reward();
+      this.main.notify('双倍收取 ' + rr.coins + ' 土豆币');
+      this.refresh();
+    }
+  } else if (action === 'idleGo') {
+    if (this.idle.rate > 0) {
+      this.main.notify('机器正在运转，稍后再来收');
+    } else {
+      this.openOverlay(new ShopOverlay(this.main, function () { self.closeOverlay(); }, 'machine'));
+    }
+  }
+};
+
+MenuScene.prototype.openOverlay = function (o) {
+  this.overlay = o;
+  Ads.hideBanner();
+};
+
+MenuScene.prototype.closeOverlay = function () {
+  this.overlay = null;
+  Ads.showBanner();
+  Economy.refresh();
+  this.refresh();
+};
+
+MenuScene.prototype.onEscape = function () {
+  if (this.overlay) this.closeOverlay();
+};
+
+module.exports = MenuScene;
+
+};
+__defs["scenes/shop"] = function(module, exports, require){
+/**
+ * 军需商店：装备升级 + 免费补给箱（激励视频）。
+ */
+var CONFIG = require('../config');
+var Platform = require('../platform');
+var Economy = require('../economy');
+var Ads = require('../ads');
+var Sound = require('../audio');
+var UI = require('../ui');
+var T = UI.T;
+
+function fmtMs(ms) {
+  var s = Math.ceil(ms / 1000);
+  var h = Math.floor(s / 3600);
+  var m = Math.floor((s % 3600) / 60);
+  var sec = s % 60;
+  function p(n) { return n < 10 ? '0' + n : '' + n; }
+  return h > 0 ? h + ':' + p(m) + ':' + p(sec) : p(m) + ':' + p(sec);
+}
+
+function ShopOverlay(main, onClose, focusId) {
+  this.main = main;
+  this.onClose = onClose;
+  this.focusId = focusId || null;
+  this.closed = false;
+  this.active = null;
+  this.t = 0;
+  this.layout();
+}
+
+ShopOverlay.prototype.layout = function () {
+  var W = this.main.W;
+  var H = this.main.H;
+  this.W = W;
+  this.H = H;
+  this.x = 12;
+  this.w = W - 24;
+  this.pad = 14;
+  this.headerH = 52;
+  this.chestH = 62;
+  this.cardGap = 7;
+  var n = CONFIG.upgrades.length;
+  var hMax = H - Platform.safeTop - 78;
+  var fixed = this.headerH + 8 + this.chestH + 10 + (n - 1) * this.cardGap + 30 + 16;
+  this.cardH = Math.max(54, Math.min(72, (hMax - fixed) / n));
+  var content = fixed + n * this.cardH;
+  this.h = Math.min(hMax, content);
+  this.y = H - Platform.safeBottom - 12 - this.h;
+  this.chestY = this.y + this.headerH + 8;
+  this.listY = this.chestY + this.chestH + 10;
+  this.refresh();
+};
+
+ShopOverlay.prototype.refresh = function () {
+  var self = this;
+  var list = [];
+  var defs = CONFIG.upgrades;
+  var chest = Economy.chestInfo();
+  this.chest = chest;
+
+  this.closeBtn = { x: this.x + this.w - 46, y: this.y + 10, w: 36, h: 36, action: 'close' };
+  this.chestBtn = {
+    x: this.x + this.w - 14 - 88, y: this.chestY + 15, w: 88, h: 32,
+    action: 'chest', pressed: false, enabled: chest.ready
+  };
+  list.push(this.chestBtn);
+
+  for (var i = 0; i < defs.length; i++) {
+    var d = defs[i];
+    var cost = Economy.upgradeCost(d.id);
+    var lv = Economy.level(d.id);
+    var cy = this.listY + i * (this.cardH + this.cardGap);
+    list.push({
+      x: this.x + this.w - 14 - 92,
+      y: cy + (this.cardH - 32) / 2,
+      w: 92,
+      h: 32,
+      action: 'buy:' + d.id,
+      id: d.id,
+      cost: cost,
+      level: lv,
+      max: lv >= d.max,
+      affordable: cost !== null && Economy.s.coins >= cost,
+      pressed: false
+    });
+  }
+  this.list = list;
+};
+
+ShopOverlay.prototype.render = function (ctx) {
+  var W = this.W;
+  var H = this.H;
+  UI.dim(ctx, W, H, 0.58);
+
+  ctx.save();
+  UI.shadow(ctx, 'rgba(0,0,0,0.35)', 26, 0, 10);
+  UI.fillRR(ctx, this.x, this.y, this.w, this.h, 24, '#FFF8E8');
+  UI.clearShadow(ctx);
+
+  // 顶部拖拽条
+  UI.fillRR(ctx, W / 2 - 20, this.y + 7, 40, 4, 2, 'rgba(126,90,56,0.22)');
+
+  // 标题
+  UI.text(ctx, '军需商店', this.x + 20, this.y + 32, 22, T.ink, 'left', 900);
+  var cw = 100;
+  var cx = this.x + this.w - 14 - 36 - 8 - cw;
+  UI.pill(ctx, cx, this.y + 16, cw, 32, 'rgba(255,248,232,0.95)', 'rgba(150,103,52,0.3)');
+  UI.drawCoin(ctx, cx + 18, this.y + 32, 10);
+  UI.text(ctx, String(Economy.s.coins), cx + cw - 10, this.y + 32, 15, T.ink, 'right', 800);
+
+  // 关闭
+  UI.fillRR(ctx, this.closeBtn.x, this.closeBtn.y, 36, 36, 12, 'rgba(126,90,56,0.09)');
+  UI.drawIcon(ctx, 'close', this.closeBtn.x + 18, this.closeBtn.y + 18, 17, T.inkSoft);
+
+  // 免费补给箱
+  var gx = this.x + 14;
+  var gy = this.chestY;
+  var gw = this.w - 28;
+  var gg = ctx.createLinearGradient(gx, gy, gx + gw, gy);
+  gg.addColorStop(0, '#FBE3AE');
+  gg.addColorStop(1, '#F3C97C');
+  UI.fillRR(ctx, gx, gy, gw, this.chestH, 16, gg);
+  UI.strokeRR(ctx, gx, gy, gw, this.chestH, 16, 'rgba(201,139,36,0.35)', 1);
+  UI.drawIcon(ctx, 'gift', gx + 30, gy + this.chestH / 2, 26, '#B76A4A');
+  UI.text(ctx, '免费补给箱', gx + 52, gy + 22, 14, '#7A4A22', 'left', 900);
+  UI.text(ctx, this.chest.ready ? '看视频领 ' + CONFIG.chest.minCoins + '-' + CONFIG.chest.maxCoins + ' 土豆币' : fmtMs(this.chest.remainMs) + ' 后可再领',
+    gx + 52, gy + 42, 10, 'rgba(122,74,34,0.8)', 'left', 600);
+
+  var cb = UI.makeButton({
+    x: this.chestBtn.x, y: this.chestBtn.y, w: this.chestBtn.w, h: this.chestBtn.h,
+    radius: 11, label: this.chest.ready ? '看视频' : '冷却中',
+    kind: 'gold', size: 11, enabled: this.chest.ready
+  });
+  cb.pressed = this.chestBtn.pressed;
+  UI.button(ctx, cb);
+
+  // 装备列表
+  for (var i = 0; i < CONFIG.upgrades.length; i++) {
+    var d = CONFIG.upgrades[i];
+    var cy = this.listY + i * (this.cardH + this.cardGap);
+    var focused = this.focusId === d.id;
+    UI.fillRR(ctx, this.x + 14, cy, this.w - 28, this.cardH, 14, focused ? '#FEF0D3' : '#F8EBCE');
+    UI.strokeRR(ctx, this.x + 14, cy, this.w - 28, this.cardH, 14, focused ? 'rgba(242,184,75,0.8)' : 'rgba(150,103,52,0.2)', 1.2);
+
+    // icon
+    var ir = Math.min(20, this.cardH * 0.32);
+    ctx.beginPath();
+    ctx.arc(this.x + 40, cy + this.cardH / 2, ir, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(184,122,66,0.14)';
+    ctx.fill();
+    UI.drawIcon(ctx, d.icon, this.x + 40, cy + this.cardH / 2, ir * 1.15, T.ink);
+
+    var lv = Economy.level(d.id);
+    var nameY = this.cardH >= 66 ? cy + 18 : cy + this.cardH / 2 - 8;
+    var effectY = this.cardH >= 66 ? cy + 36 : cy + this.cardH / 2 + 9;
+    UI.text(ctx, d.name, this.x + 66, nameY, 14, T.ink, 'left', 900);
+    var nameW = UI.measure(ctx, d.name, 14, 900);
+    UI.pill(ctx, this.x + 66 + nameW + 7, nameY - 8, 34, 17, 'rgba(111,168,94,0.16)');
+    UI.text(ctx, 'Lv.' + lv, this.x + 66 + nameW + 24, nameY - 0, 9.5, T.greenDark, 'center', 800);
+
+    UI.text(ctx, Economy.effectText(d.id), this.x + 66, effectY, 10, T.inkSoft, 'left', 600);
+    if (this.cardH >= 66) UI.text(ctx, d.brief, this.x + 66, cy + 51, 9, 'rgba(126,90,56,0.7)', 'left', 600);
+
+    var b = null;
+    for (var k = 0; k < this.list.length; k++) {
+      if (this.list[k].action === 'buy:' + d.id) { b = this.list[k]; break; }
+    }
+    if (b) {
+      var label = b.max ? '已满级' : (b.cost != null ? '升级 ' + b.cost : '—');
+      var kind = b.max ? 'secondary' : (b.affordable ? 'primary' : 'secondary');
+      var btn = UI.makeButton({
+        x: b.x, y: b.y, w: b.w, h: b.h, radius: 12,
+        label: label, kind: kind, size: 11, enabled: !b.max && b.affordable
+      });
+      btn.pressed = b.pressed;
+      UI.button(ctx, btn);
+    }
+  }
+
+  UI.text(ctx, '装备永久生效 · 广告收入用于军需处运转', W / 2, this.y + this.h - 12, 9, 'rgba(126,90,56,0.55)', 'center', 600);
+  ctx.restore();
+};
+
+ShopOverlay.prototype.update = function (dt) {
+  this.t += dt;
+};
+
+ShopOverlay.prototype.onDown = function (p) {
+  this.active = null;
+  if (UI.hit(this.closeBtn, p.x, p.y)) { this.active = this.closeBtn; return; }
+  for (var i = 0; i < this.list.length; i++) {
+    var b = this.list[i];
+    if (b.enabled !== false && UI.hit(b, p.x, p.y)) { this.active = b; b.pressed = true; Sound.tap(); return; }
+  }
+};
+
+ShopOverlay.prototype.onUp = function (p) {
+  var a = this.active;
+  this.active = null;
+  if (a) a.pressed = false;
+  if (!a || !UI.hit(a, p.x, p.y)) return;
+
+  if (a.action === 'close') {
+    this.closed = true;
+    if (this.onClose) this.onClose();
+  } else if (a.action === 'chest') {
+    this.claimChest();
+  } else if (a.action.indexOf('buy:') === 0) {
+    this.buy(a.action.slice(4));
+  }
+};
+
+ShopOverlay.prototype.claimChest = function () {
+  var self = this;
+  var info = Economy.chestInfo();
+  if (!info.ready) { this.main.notify('补给箱还在冷却中'); return; }
+  this.main.rewarded('free_chest', function () {
+    var r = Economy.claimChest();
+    if (r.ok) {
+      Sound.coin();
+      self.main.notify('补给箱 +' + r.coins + ' 土豆币');
+      self.refresh();
+    }
+  });
+};
+
+ShopOverlay.prototype.buy = function (id) {
+  var r = Economy.buyUpgrade(id);
+  if (r.ok) {
+    Sound.upgrade();
+    Platform.haptic('medium');
+    this.main.notify('升级成功 · Lv.' + r.level);
+    this.refresh();
+  } else if (r.reason === 'coins') {
+    this.main.notify('土豆币不够，还差 ' + (r.cost - Economy.s.coins));
+	} else if (r.reason === 'max') {
+    this.main.notify('已经满级了');
+  }
+};
+
+module.exports = ShopOverlay;
+
+};
+__defs["scenes/daily"] = function(module, exports, require){
+/**
+ * 每日补给 + 今日任务。
+ */
+var CONFIG = require('../config');
+var Platform = require('../platform');
+var Economy = require('../economy');
+var Sound = require('../audio');
+var UI = require('../ui');
+var T = UI.T;
+
+function DailyOverlay(main, mode, onClose) {
+  this.main = main;
+  this.mode = mode === 'tasks' ? 'tasks' : 'daily';
+  this.onClose = onClose;
+  this.closed = false;
+  this.active = null;
+  this.t = 0;
+  this.layout();
+}
+
+DailyOverlay.prototype.layout = function () {
+  var W = this.main.W;
+  var H = this.main.H;
+  this.W = W;
+  this.H = H;
+  this.x = 12;
+  this.w = W - 24;
+  var avail = H - Platform.safeTop - 100;
+  this.h = Math.min(avail, this.mode === 'daily' ? 302 : 386);
+  this.y = H - Platform.safeBottom - 12 - this.h;
+  this.closeBtn = { x: this.x + this.w - 46, y: this.y + 10, w: 36, h: 36 };
+  this.tabY = this.y + 50;
+  this.tabH = 36;
+  this.contentY = this.tabY + this.tabH + 12;
+  this.refresh();
+};
+
+DailyOverlay.prototype.refresh = function () {
+  this.daily = Economy.dailyInfo();
+  this.quests = Economy.questList();
+  var W = this.W;
+  var contentX = this.x + 14;
+  var contentW = this.w - 28;
+
+  var tabW = (contentW - 8) / 2;
+  this.tabs = [
+    { x: contentX, y: this.tabY, w: tabW, h: this.tabH, mode: 'daily', label: '每日补给' },
+    { x: contentX + tabW + 8, y: this.tabY, w: tabW, h: this.tabH, mode: 'tasks', label: '今日任务' }
+  ];
+
+  var buttons = [];
+  if (this.mode === 'daily') {
+    this.tileGap = 4;
+    this.tileW = (contentW - this.tileGap * 6) / 7;
+    this.tileH = 72;
+    this.gridY = this.contentY + 6;
+    this.claimBtn = {
+      x: contentX, y: this.gridY + this.tileH + 16, w: contentW, h: 46,
+      action: 'dailyClaim', pressed: false
+    };
+    this.doubleBtn = {
+      x: contentX, y: this.gridY + this.tileH + 16, w: contentW, h: 46,
+      action: 'dailyDouble', pressed: false
+    };
+    buttons.push(this.daily.claimedToday && this.daily.doubleAvailable ? this.doubleBtn : this.claimBtn);
+  } else {
+    this.rowGap = 7;
+    this.rowH = Math.max(52, Math.min(64, (this.h - (this.contentY - this.y) - 30 - this.rowGap * 3) / 4));
+    this.questBtns = [];
+    for (var i = 0; i < this.quests.length; i++) {
+      var q = this.quests[i];
+      buttons.push({
+        x: contentX + contentW - 74,
+        y: this.contentY + i * (this.rowH + this.rowGap) + (this.rowH - 30) / 2,
+        w: 74, h: 30, action: 'quest:' + q.id, pressed: false, id: q.id, enabled: q.canClaim
+      });
+    }
+  }
+  this.buttons = buttons;
+};
+
+DailyOverlay.prototype.render = function (ctx) {
+  var W = this.W;
+  var H = this.H;
+  UI.dim(ctx, W, H, 0.58);
+
+  ctx.save();
+  UI.shadow(ctx, 'rgba(0,0,0,0.35)', 26, 0, 10);
+  UI.fillRR(ctx, this.x, this.y, this.w, this.h, 24, '#FFF8E8');
+  UI.clearShadow(ctx);
+  UI.fillRR(ctx, W / 2 - 20, this.y + 7, 40, 4, 2, 'rgba(126,90,56,0.22)');
+
+  UI.text(ctx, this.mode === 'daily' ? '每日补给' : '今日任务', this.x + 20, this.y + 32, 22, T.ink, 'left', 900);
+  var cw = 100;
+  var cx = this.x + this.w - 14 - 36 - 8 - cw;
+  UI.pill(ctx, cx, this.y + 16, cw, 32, 'rgba(255,248,232,0.95)', 'rgba(150,103,52,0.3)');
+  UI.drawCoin(ctx, cx + 18, this.y + 32, 10);
+  UI.text(ctx, String(Economy.s.coins), cx + cw - 10, this.y + 32, 15, T.ink, 'right', 800);
+  UI.fillRR(ctx, this.closeBtn.x, this.closeBtn.y, 36, 36, 12, 'rgba(126,90,56,0.09)');
+  UI.drawIcon(ctx, 'close', this.closeBtn.x + 18, this.closeBtn.y + 18, 17, T.inkSoft);
+
+  // tabs
+  for (var i = 0; i < this.tabs.length; i++) {
+    var tab = this.tabs[i];
+    var on = tab.mode === this.mode;
+    UI.fillRR(ctx, tab.x, tab.y, tab.w, tab.h, 12, on ? '#6FA85E' : 'rgba(126,90,56,0.08)');
+    UI.text(ctx, tab.label, tab.x + tab.w / 2, tab.y + tab.h / 2, 13, on ? '#FFFDF4' : T.inkSoft, 'center', 800);
+  }
+
+  if (this.mode === 'daily') {
+    this.renderDaily(ctx);
+  } else {
+    this.renderTasks(ctx);
+  }
+
+  UI.text(ctx, '每日 0 点刷新 · 看广告可获得额外收益', W / 2, this.y + this.h - 12, 9, 'rgba(126,90,56,0.55)', 'center', 600);
+  ctx.restore();
+};
+
+DailyOverlay.prototype.renderDaily = function (ctx) {
+  var x = this.x + 14;
+  var y = this.gridY;
+  var info = this.daily;
+  var streak = Economy.s.daily.streak || 0;
+  var claimedCount = info.claimedToday ? ((Math.max(1, streak) - 1) % 7) + 1 : streak % 7;
+  var todayIndex = info.day;
+
+  for (var i = 0; i < 7; i++) {
+    var tx = x + i * (this.tileW + this.tileGap);
+    var claimed = (i + 1) <= claimedCount;
+    var isToday = (i + 1) === todayIndex;
+    var fill = claimed ? 'rgba(111,168,94,0.18)' : (isToday ? '#FCE3A9' : 'rgba(126,90,56,0.06)');
+    UI.fillRR(ctx, tx, y, this.tileW, this.tileH, 10, fill);
+    if (isToday) UI.strokeRR(ctx, tx, y, this.tileW, this.tileH, 10, 'rgba(242,184,75,0.9)', 1.6);
+    UI.text(ctx, 'D' + (i + 1), tx + this.tileW / 2, y + 14, 9.5, claimed ? T.greenDark : T.inkSoft, 'center', 800);
+    UI.drawCoin(ctx, tx + this.tileW / 2, y + 35, 8.5);
+    UI.text(ctx, String(CONFIG.dailyRewards[i]), tx + this.tileW / 2, y + 54, 11, claimed ? T.greenDark : T.ink, 'center', 800);
+    if (claimed) {
+      ctx.beginPath();
+      ctx.arc(tx + this.tileW - 8, y + 8, 7, 0, Math.PI * 2);
+      ctx.fillStyle = T.green;
+      ctx.fill();
+      UI.drawIcon(ctx, 'check', tx + this.tileW - 8, y + 8, 8, '#FFF');
+    }
+  }
+
+  UI.text(ctx, '连续登录第 ' + Math.max(1, info.claimedToday ? streak : info.nextStreak) + ' 天', x, y + this.tileH + 3, 10.5, T.inkSoft, 'left', 600);
+
+  var showDouble = info.claimedToday && info.doubleAvailable;
+  var b;
+  if (showDouble) {
+    b = UI.makeButton({
+      x: this.doubleBtn.x, y: this.doubleBtn.y, w: this.doubleBtn.w, h: this.doubleBtn.h,
+      radius: 15, label: '看视频再翻倍 +' + (info.lastReward || 0), kind: 'gold', size: 15
+    });
+    b.pressed = this.doubleBtn.pressed;
+    UI.button(ctx, b);
+  } else {
+    var label = info.claimedToday ? '今日已领取' : '领取第 ' + info.day + ' 天 +' + info.reward;
+    b = UI.makeButton({
+      x: this.claimBtn.x, y: this.claimBtn.y, w: this.claimBtn.w, h: this.claimBtn.h,
+      radius: 15, label: label, kind: info.claimedToday ? 'secondary' : 'primary', size: 15,
+      enabled: !info.claimedToday
+    });
+    b.pressed = this.claimBtn.pressed;
+    UI.button(ctx, b);
+  }
+
+  UI.text(ctx, '提示：补给箱与每日奖励都可以用激励视频翻倍', this.W / 2, this.claimBtn.y + 66, 9.5, 'rgba(126,90,56,0.6)', 'center', 600);
+};
+
+DailyOverlay.prototype.renderTasks = function (ctx) {
+  var x = this.x + 14;
+  var y = this.contentY;
+  var contentW = this.w - 28;
+
+  for (var i = 0; i < this.quests.length; i++) {
+    var q = this.quests[i];
+    var ry = y + i * (this.rowH + this.rowGap);
+    UI.fillRR(ctx, x, ry, contentW, this.rowH, 13, 'rgba(126,90,56,0.06)');
+    UI.text(ctx, q.text, x + 12, ry + 17, 12, T.ink, 'left', 800);
+    UI.text(ctx, q.progress + '/' + q.target, x + contentW - 84, ry + 17, 10, T.inkSoft, 'right', 700);
+    UI.bar(ctx, x + 12, ry + this.rowH - 16, contentW - 108, 5, q.progress / q.target, T.green, 'rgba(126,90,56,0.14)', 2.5);
+
+    var b = null;
+    for (var k = 0; k < this.buttons.length; k++) {
+      if (this.buttons[k].action === 'quest:' + q.id) { b = this.buttons[k]; break; }
+    }
+    if (b) {
+      var label = q.claimed ? '已领取' : (q.canClaim ? '+' + q.reward : '进行中');
+      var btn = UI.makeButton({
+        x: b.x, y: b.y, w: b.w, h: b.h, radius: 10, label: label,
+        kind: q.canClaim ? 'gold' : 'secondary', size: 10, enabled: q.canClaim
+      });
+      btn.pressed = b.pressed;
+      UI.button(ctx, btn);
+    }
+  }
+};
+
+DailyOverlay.prototype.update = function (dt) {
+  this.t += dt;
+};
+
+DailyOverlay.prototype.onDown = function (p) {
+  this.active = null;
+  if (UI.hit(this.closeBtn, p.x, p.y)) { this.active = this.closeBtn; return; }
+  for (var i = 0; i < this.tabs.length; i++) {
+    if (UI.hit(this.tabs[i], p.x, p.y)) { this.active = this.tabs[i]; Sound.tap(); return; }
+  }
+  for (var j = 0; j < this.buttons.length; j++) {
+    var b = this.buttons[j];
+    if (UI.hit(b, p.x, p.y)) {
+      if (b.enabled === false) return;
+      this.active = b;
+      b.pressed = true;
+      Sound.tap();
+      return;
+    }
+  }
+};
+
+DailyOverlay.prototype.onUp = function (p) {
+  var a = this.active;
+  this.active = null;
+  if (a && a.pressed !== undefined) a.pressed = false;
+  if (!a || !UI.hit(a, p.x, p.y)) return;
+
+  if (a === this.closeBtn) {
+    this.closed = true;
+    if (this.onClose) this.onClose();
+    return;
+  }
+  if (a.mode) {
+    this.mode = a.mode;
+    this.layout();
+    return;
+  }
+  if (a.action === 'dailyClaim') {
+    var r = Economy.claimDaily();
+    if (r.ok) {
+      Sound.coin();
+      this.main.notify('第 ' + r.day + ' 天补给 +' + r.reward + ' 土豆币');
+      this.refresh();
+    }
+  } else if (a.action === 'dailyDouble') {
+    var self = this;
+    this.main.rewarded('daily_double', function () {
+      var rr = Economy.doubleDaily();
+      if (rr.ok) {
+        Sound.coin();
+        self.main.notify('每日补给翻倍 +' + rr.reward);
+        self.refresh();
+      }
+    });
+  } else if (a.action && a.action.indexOf('quest:') === 0) {
+    var res = Economy.claimQuest(a.action.slice(6));
+    if (res.ok) {
+      Sound.coin();
+      this.main.notify('任务完成 +' + res.reward + ' 土豆币');
+      this.refresh();
+    }
+  }
+};
+
+module.exports = DailyOverlay;
+
+};
+__defs["scenes/settings"] = function(module, exports, require){
+/**
+ * 设置与关于。
+ */
+var CONFIG = require('../config');
+var Platform = require('../platform');
+var Economy = require('../economy');
+var Sound = require('../audio');
+var UI = require('../ui');
+var T = UI.T;
+
+function SettingsOverlay(main, onClose) {
+  this.main = main;
+  this.onClose = onClose;
+  this.closed = false;
+  this.active = null;
+  this.resetArmed = false;
+  this.armT = 0;
+  this.layout();
+}
+
+SettingsOverlay.prototype.layout = function () {
+  var W = this.main.W;
+  var H = this.main.H;
+  this.W = W;
+  this.H = H;
+  this.w = Math.min(W - 36, 340);
+  this.h = 400;
+  this.x = (W - this.w) / 2;
+  this.y = (H - this.h) / 2;
+  this.build();
+};
+
+SettingsOverlay.prototype.build = function () {
+  var x = this.x;
+  var y = this.y;
+  var w = this.w;
+  this.rows = [
+    { x: x + 16, y: y + 74, w: w - 32, h: 52, action: 'sound' },
+    { x: x + 16, y: y + 132, w: w - 32, h: 52, action: 'haptic' }
+  ];
+  this.closeBtn = { x: x + w - 46, y: y + 12, w: 36, h: 36 };
+  this.shareBtn = { x: x + 16, y: y + 218, w: w - 32, h: 46, action: 'share', pressed: false };
+  this.resetBtn = { x: x + 16, y: y + 274, w: w - 32, h: 40, action: 'reset', pressed: false };
+};
+
+SettingsOverlay.prototype.render = function (ctx) {
+  UI.dim(ctx, this.W, this.H, 0.6);
+  var x = this.x;
+  var y = this.y;
+  var w = this.w;
+  ctx.save();
+  UI.shadow(ctx, 'rgba(0,0,0,0.35)', 26, 0, 10);
+  UI.fillRR(ctx, x, y, w, this.h, 22, '#FFF8E8');
+  UI.clearShadow(ctx);
+
+  UI.text(ctx, '设置', x + 20, y + 30, 21, T.ink, 'left', 900);
+  UI.fillRR(ctx, this.closeBtn.x, this.closeBtn.y, 36, 36, 12, 'rgba(126,90,56,0.09)');
+  UI.drawIcon(ctx, 'close', this.closeBtn.x + 18, this.closeBtn.y + 18, 17, T.inkSoft);
+
+  // 音效 / 震动
+  this.drawToggleRow(ctx, this.rows[0], '音效', Economy.s.settings.sound, 'sound', true);
+  this.drawToggleRow(ctx, this.rows[1], '震动反馈', Economy.s.settings.haptics, 'hand', false);
+
+  var sb = UI.makeButton({
+    x: this.shareBtn.x, y: this.shareBtn.y, w: this.shareBtn.w, h: this.shareBtn.h,
+    radius: 14, label: '分享给工友', kind: 'primary', size: 14, icon: 'share'
+  });
+  sb.pressed = this.shareBtn.pressed;
+  UI.button(ctx, sb);
+
+  var rb = UI.makeButton({
+    x: this.resetBtn.x, y: this.resetBtn.y, w: this.resetBtn.w, h: this.resetBtn.h,
+    radius: 12, label: this.resetArmed ? '再次点击确认清空存档' : '清空存档',
+    kind: 'secondary', size: 11.5
+  });
+  rb.pressed = this.resetBtn.pressed;
+  UI.button(ctx, rb);
+
+  UI.text(ctx, CONFIG.title + ' v' + CONFIG.version, x + w / 2, y + 336, 11, T.ink, 'center', 800);
+  UI.text(ctx, '灵感来自 Steam《Potato Please》', x + w / 2, y + 354, 9.5, T.inkSoft, 'center', 600);
+  UI.text(ctx, '广告由微信流量主提供 · 无内购', x + w / 2, y + 370, 9.5, T.inkSoft, 'center', 600);
+  ctx.restore();
+};
+
+SettingsOverlay.prototype.drawToggleRow = function (ctx, r, label, on, icon, isSound) {
+  UI.fillRR(ctx, r.x, r.y, r.w, r.h, 13, 'rgba(126,90,56,0.06)');
+  UI.drawIcon(ctx, icon, r.x + 26, r.y + r.h / 2, 20, T.ink);
+  UI.text(ctx, label, r.x + 48, r.y + r.h / 2, 13, T.ink, 'left', 800);
+  var sw = 48;
+  var sh = 28;
+  var sx = r.x + r.w - 14 - sw;
+  var sy = r.y + (r.h - sh) / 2;
+  UI.fillRR(ctx, sx, sy, sw, sh, sh / 2, on ? T.green : 'rgba(126,90,56,0.22)');
+  ctx.beginPath();
+  ctx.arc(sx + (on ? sw - sh / 2 : sh / 2), sy + sh / 2, sh / 2 - 3, 0, Math.PI * 2);
+  ctx.fillStyle = '#FFFDF4';
+  ctx.fill();
+};
+
+SettingsOverlay.prototype.update = function (dt) {
+  if (this.resetArmed) {
+    this.armT -= dt;
+    if (this.armT <= 0) { this.resetArmed = false; }
+  }
+};
+
+SettingsOverlay.prototype.onDown = function (p) {
+  this.active = null;
+  if (UI.hit(this.closeBtn, p.x, p.y)) { this.active = this.closeBtn; return; }
+  for (var i = 0; i < this.rows.length; i++) {
+    if (UI.hit(this.rows[i], p.x, p.y)) { this.active = this.rows[i]; Sound.tap(); return; }
+  }
+  if (UI.hit(this.shareBtn, p.x, p.y)) { this.active = this.shareBtn; this.shareBtn.pressed = true; Sound.tap(); return; }
+  if (UI.hit(this.resetBtn, p.x, p.y)) { this.active = this.resetBtn; this.resetBtn.pressed = true; Sound.tap(); }
+};
+
+SettingsOverlay.prototype.onUp = function (p) {
+  var a = this.active;
+  this.active = null;
+  if (this.shareBtn) this.shareBtn.pressed = false;
+  if (this.resetBtn) this.resetBtn.pressed = false;
+  if (!a || !UI.hit(a, p.x, p.y)) return;
+
+  if (a === this.closeBtn) {
+    this.closed = true;
+    if (this.onClose) this.onClose();
+  } else if (a.action === 'sound') {
+    var on = !Economy.s.settings.sound;
+    Economy.setSetting('sound', on);
+    Sound.setMuted(!on);
+    if (on) Sound.tap();
+  } else if (a.action === 'haptic') {
+    var h = !Economy.s.settings.haptics;
+    Economy.setSetting('haptics', h);
+    if (h) Platform.haptic('medium');
+  } else if (a.action === 'share') {
+    this.main.shareGame();
+  } else if (a.action === 'reset') {
+    if (!this.resetArmed) {
+      this.resetArmed = true;
+      this.armT = 3;
+      this.main.notify('再次点击“清空存档”以确认');
+    } else {
+      Economy.resetAll();
+      Sound.setMuted(!Economy.s.settings.sound);
+      this.main.notify('存档已清空');
+      this.closed = true;
+      if (this.onClose) this.onClose();
+    }
+  }
+};
+
+module.exports = SettingsOverlay;
+
+};
+__defs["scenes/play"] = function(module, exports, require){
+/**
+ * 削皮玩法：滑动擦除土豆皮，控制浪费，限时交单。
+ */
+var CONFIG = require('../config');
+var Platform = require('../platform');
+var Economy = require('../economy');
+var Ads = require('../ads');
+var Sound = require('../audio');
+var UI = require('../ui');
+var T = UI.T;
+var Potato = require('../potato');
+var FX = require('../fx');
+var render3d = require('../render3d');
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function fmtTime(s) {
+  s = Math.max(0, Math.ceil(s));
+  var m = Math.floor(s / 60);
+  var ss = s % 60;
+  return m + ':' + (ss < 10 ? '0' : '') + ss;
+}
+function easeOutBack(x) {
+  var c1 = 1.70158;
+  var c3 = c1 + 1;
+  return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+}
+
+function PlayScene(main) {
+  this.main = main;
+  this._3d = !!main._3dOk;
+  this.order = Economy.nextOrder();
+  this.effects = Economy.effects();
+  this.results = [];
+  this.index = 0;
+  this.timeLeft = this.order.timeLimit;
+  this.timerStarted = false;
+  this.t = 0;
+  this.fx = new FX();
+  this.dragging = false;
+  this.pressedAction = null;
+  this.overlayT = 0;
+  this.serveT = 0;
+  this.leaving = false;
+  this.revived = false;
+  this.doubled = false;
+  this.summary = null;
+  this.targetCoins = 0;
+  this.coinShown = 0;
+  this.wasteFlash = 0;
+  this.peelHapticT = 0;
+  this.wasteTextT = 0;
+  this.targetNotified = false;
+  this.hintT = 0;
+  this.lastPoint = null;
+  this.tutorial = !Economy.s.tutorialDone;
+  this.state = this.tutorial ? 'tutorial' : 'play';
+  this._tool = 'knife'; // 当前选中工具
+  this.layout();
+  this.spawnPotato(0);
+  this.state = this.tutorial ? 'tutorial' : 'play';
+}
+
+PlayScene.prototype.enter = function () {
+  Ads.hideBanner();
+  if (this._3d) {
+    render3d.setPotatoVisible(true);
+    render3d.setClearColor(0x2a1a10, 1); // 深色背景，让 3D 土豆突出
+    render3d.setTool(this._tool);
+  }
+};
+
+PlayScene.prototype.onHide = function () {
+  if (this.state === 'play') this.openPause();
+  Economy.save();
+  if (this._3d) render3d.setPotatoVisible(false);
+};
+
+PlayScene.prototype.layout = function () {
+  var W = this.main.W;
+  var H = this.main.H;
+  var st = Platform.safeTop;
+  var sb = Platform.safeBottom;
+  this.W = W;
+  this.H = H;
+  this.safeTop = st;
+  this.safeBottom = sb;
+  this.R = Math.min(W * 0.31, H * 0.16, 132);
+  this.cx = W / 2;
+  this.cy = st + H * 0.42;
+  this.boardY = this.cy + this.R * 0.92;
+
+  this.progressW = Math.min(W - 32, 322);
+  this.progressH = 66;
+  this.progressX = (W - this.progressW) / 2;
+  this.progressY = this.boardY + this.R * 0.34 + 10;
+
+  this.pauseBtn = { x: 16, y: st + 10, w: 42, h: 42 };
+  this.completeBtn = { x: (W - 200) / 2, y: H - sb - 100, w: 200, h: 52 };
+
+  // 结果卡
+  var rw = Math.min(W - 36, 344);
+  var rh = Math.min(480, H - 56);
+  this.resultCard = { x: (W - rw) / 2, y: (H - rh) / 2, w: rw, h: rh };
+  this.resultDoubleBtn = { x: this.resultCard.x + 20, y: this.resultCard.y + 318, w: rw - 40, h: 44, action: 'double', pressed: false };
+  this.resultNextBtn = { x: this.resultCard.x + 20, y: this.resultCard.y + 370, w: rw - 40, h: 48, action: 'next', pressed: false };
+  this.resultHomeBtn = { x: this.resultCard.x + 20, y: this.resultCard.y + 426, w: rw - 40, h: 38, action: 'home', pressed: false };
+
+  // 暂停卡
+  var pw = Math.min(W - 44, 320);
+  var ph = 316;
+  this.pauseCard = { x: (W - pw) / 2, y: (H - ph) / 2, w: pw, h: ph };
+  this.pauseResumeBtn = { x: this.pauseCard.x + 24, y: this.pauseCard.y + 138, w: pw - 48, h: 48, action: 'resume', pressed: false };
+  this.pauseRestartBtn = { x: this.pauseCard.x + 24, y: this.pauseCard.y + 196, w: pw - 48, h: 44, action: 'restart', pressed: false };
+  this.pauseHomeBtn = { x: this.pauseCard.x + 24, y: this.pauseCard.y + 250, w: pw - 48, h: 40, action: 'home', pressed: false };
+
+  // 失败卡
+  var fw = Math.min(W - 44, 330);
+  var fh = 336;
+  this.failCard = { x: (W - fw) / 2, y: (H - fh) / 2, w: fw, h: fh };
+  this.failReviveBtn = { x: this.failCard.x + 24, y: this.failCard.y + 164, w: fw - 48, h: 46, action: 'revive', pressed: false };
+  this.failRestartBtn = { x: this.failCard.x + 24, y: this.failCard.y + 218, w: fw - 48, h: 44, action: 'restart', pressed: false };
+  this.failHomeBtn = { x: this.failCard.x + 24, y: this.failCard.y + 272, w: fw - 48, h: 38, action: 'home', pressed: false };
+
+  // 教学卡
+  var tw = Math.min(W - 44, 330);
+  var th = 336;
+  this.tutorialCard = { x: (W - tw) / 2, y: (H - th) / 2, w: tw, h: th };
+  this.tutorialBtn = { x: this.tutorialCard.x + 24, y: this.tutorialCard.y + th - 70, w: tw - 48, h: 46, action: 'tutorialStart', pressed: false };
+
+  // 工具选择栏（3D 模式专用）
+  var toolY = Math.min(H - sb - 16, this.boardY + this.R * 0.34 + 100);
+  var btnSq = 52;
+  var gap = 12;
+  var totalW = btnSq * 3 + gap * 2;
+  var startX = (W - totalW) / 2;
+  this.toolBtns = [
+    { id: 'knife',  label: '削皮刀', x: startX, y: toolY, w: btnSq, h: btnSq, pressed: false },
+    { id: 'fork',   label: '叉子',  x: startX + btnSq + gap, y: toolY, w: btnSq, h: btnSq, pressed: false },
+    { id: 'grater', label: '刨丝器', x: startX + (btnSq + gap) * 2, y: toolY, w: btnSq, h: btnSq, pressed: false }
+  ];
+};
+
+PlayScene.prototype.spawnPotato = function (i) {
+  if (this.potato) this.potato.dispose();
+  var golden = this.order.goldenIndex === i;
+  var target = golden ? CONFIG.order.goldenPeel : this.order.target;
+  var seed = (Platform.now() + i * 7919 + this.order.index * 104729) >>> 0;
+  this.potato = new Potato({
+    cx: this.cx,
+    cy: this.cy,
+    R: this.R * (0.97 + (i % 3) * 0.015),
+    dpr: this.main.dpr,
+    golden: golden,
+    target: target,
+    brush: this.effects.brush,
+    wasteDepth: this.effects.wasteDepth,
+    seed: seed
+  });
+  this.currentGolden = golden;
+  this.currentTarget = target;
+  this.targetNotified = false;
+  this.serveT = 0;
+  this.dragging = false;
+  this.lastPoint = null;
+
+  if (this._3d) {
+    render3d.resetSkin(golden);
+    render3d.positionPotato(this.cx, this.cy, this.potato.R);
+  }
+};
+
+PlayScene.prototype.onDown = function (p) {
+  if (this.leaving) return;
+  var st = this.state;
+
+  if (st === 'tutorial') {
+    if (UI.hit(this.tutorialBtn, p.x, p.y)) this.pressedAction = 'tutorialStart';
+    return;
+  }
+  if (st === 'paused') {
+    if (UI.hit(this.pauseResumeBtn, p.x, p.y)) this.pressedAction = 'resume';
+    else if (UI.hit(this.pauseRestartBtn, p.x, p.y)) this.pressedAction = 'restart';
+    else if (UI.hit(this.pauseHomeBtn, p.x, p.y)) this.pressedAction = 'home';
+    if (this.pressedAction) Sound.tap();
+    return;
+  }
+  if (st === 'result') {
+    if (UI.hit(this.resultDoubleBtn, p.x, p.y)) this.pressedAction = 'double';
+    else if (UI.hit(this.resultNextBtn, p.x, p.y)) this.pressedAction = 'next';
+    else if (UI.hit(this.resultHomeBtn, p.x, p.y)) this.pressedAction = 'home';
+    if (this.pressedAction) Sound.tap();
+    return;
+  }
+  if (st === 'fail') {
+    if (UI.hit(this.failReviveBtn, p.x, p.y)) this.pressedAction = 'revive';
+    else if (UI.hit(this.failRestartBtn, p.x, p.y)) this.pressedAction = 'restart';
+    else if (UI.hit(this.failHomeBtn, p.x, p.y)) this.pressedAction = 'home';
+    if (this.pressedAction) Sound.tap();
+    return;
+  }
+  if (st !== 'play') return;
+
+  // 3D 工具按钮
+  if (this._3d) {
+    for (var ti = 0; ti < this.toolBtns.length; ti++) {
+      var tb = this.toolBtns[ti];
+      if (UI.hit(tb, p.x, p.y)) {
+        this._tool = tb.id;
+        render3d.setTool(this._tool);
+        Sound.tap();
+        return;
+      }
+    }
+  }
+
+  if (UI.hit(this.pauseBtn, p.x, p.y)) { this.pressedAction = 'pause'; Sound.tap(); return; }
+  if (this.canComplete() && UI.hit(this.completeBtn, p.x, p.y)) {
+    this.pressedAction = 'complete';
+    Sound.tap();
+    return;
+  }
+
+  this.dragging = true;
+  this.lastPoint = { x: p.x, y: p.y };
+  this.potato.beginStroke(p.x, p.y);
+  if (!this.timerStarted) {
+    this.timerStarted = true;
+    Platform.reportEvent('order_start_peel', { order: this.order.index });
+  }
+  this.hintT = 99;
+};
+
+PlayScene.prototype.onMove = function (p) {
+  if (this.state !== 'play' || !this.dragging || !this.lastPoint) return;
+  var dx = p.x - this.lastPoint.x;
+  var dy = p.y - this.lastPoint.y;
+  var res = this.potato.peelTo(p.x, p.y);
+  if (this._3d) {
+    render3d.peelTrail(this.lastPoint.x, this.lastPoint.y, p.x, p.y, this.effects.brush || 14);
+  }
+  if (res.removed > 0) {
+    Sound.peel();
+    if (this.peelHapticT <= 0) {
+      Platform.haptic('light');
+      this.peelHapticT = 0.11;
+    }
+    this.fx.peelBurst(p.x, p.y, dx, dy, this.currentGolden ? 2 : 2, this.currentGolden);
+  }
+  if (res.wasteAdded > 0) {
+    this.wasteFlash = Math.min(0.5, this.wasteFlash + 0.16);
+    if (this.wasteTextT <= 0) {
+      this.fx.floatText(p.x, p.y - 26, '浪费!', T.red, 14);
+      this.wasteTextT = 0.8;
+    }
+    Platform.haptic('medium');
+  }
+  this.lastPoint = { x: p.x, y: p.y };
+
+  if (!this.targetNotified && this.potato.progress() >= this.potato.target) {
+    this.targetNotified = true;
+    Sound.star();
+    Platform.haptic('medium');
+    this.main.notify('削净达标，可以交差了');
+  }
+};
+
+PlayScene.prototype.onUp = function (p) {
+  if (this.leaving) return;
+  var st = this.state;
+  var a = this.pressedAction;
+  this.pressedAction = null;
+
+  if (st === 'tutorial') {
+    if (a === 'tutorialStart' && UI.hit(this.tutorialBtn, p.x, p.y)) this.startTutorial();
+    return;
+  }
+  if (st === 'paused') {
+    if (a === 'resume' && UI.hit(this.pauseResumeBtn, p.x, p.y)) { this.state = 'play'; Sound.tap(); }
+    else if (a === 'restart' && UI.hit(this.pauseRestartBtn, p.x, p.y)) this.restartOrder();
+    else if (a === 'home' && UI.hit(this.pauseHomeBtn, p.x, p.y)) this.main.toMenu();
+    return;
+  }
+  if (st === 'result') {
+    if (a === 'double' && UI.hit(this.resultDoubleBtn, p.x, p.y)) this.doubleResult();
+    else if (a === 'next' && UI.hit(this.resultNextBtn, p.x, p.y)) this.leaveTo('next');
+    else if (a === 'home' && UI.hit(this.resultHomeBtn, p.x, p.y)) this.leaveTo('home');
+    return;
+  }
+  if (st === 'fail') {
+    if (a === 'revive' && UI.hit(this.failReviveBtn, p.x, p.y)) this.revive();
+    else if (a === 'restart' && UI.hit(this.failRestartBtn, p.x, p.y)) this.restartOrder();
+    else if (a === 'home' && UI.hit(this.failHomeBtn, p.x, p.y)) this.main.toMenu();
+    return;
+  }
+  if (st !== 'play') return;
+
+  if (a === 'pause' && UI.hit(this.pauseBtn, p.x, p.y)) { this.openPause(); return; }
+  if (a === 'complete' && UI.hit(this.completeBtn, p.x, p.y)) { this.finishPotato(); return; }
+  if (this.dragging) {
+    this.potato.endStroke();
+    this.dragging = false;
+  }
+};
+
+PlayScene.prototype.startTutorial = function () {
+  this.tutorial = false;
+  this.state = 'play';
+  Economy.markTutorialDone();
+  Sound.tap();
+};
+
+PlayScene.prototype.openPause = function () {
+  if (this.state !== 'play') return;
+  this.state = 'paused';
+  this.dragging = false;
+  this.pressedAction = null;
+  this.overlayT = 0;
+};
+
+PlayScene.prototype.restartOrder = function () {
+  if (this.leaving) return;
+  this.leaving = true;
+  this.main.startOrder();
+};
+
+PlayScene.prototype.canComplete = function () {
+  return this.state === 'play' && this.potato && this.potato.progress() >= this.potato.target;
+};
+
+PlayScene.prototype.finishPotato = function () {
+  if (!this.canComplete()) return;
+  var waste = this.potato.waste();
+  var peel = this.potato.progress();
+  var grade = Economy.gradeForWaste(waste);
+  this.results.push({ waste: waste, peel: peel, grade: grade, golden: this.currentGolden });
+  this.state = 'serving';
+  this.serveT = 0;
+  this.dragging = false;
+  this.potato.endStroke();
+  this.potato.completed = true;
+
+  Sound.complete();
+  Platform.haptic('heavy');
+  this.fx.sparkle(this.cx, this.cy, 18, this.currentGolden ? '#FFE28A' : '#F2B84B', 60);
+  this.fx.floatText(this.cx, this.cy - this.R * 0.4, grade.key + ' · ' + grade.name, grade.color, 24);
+};
+
+PlayScene.prototype.completeOrder = function () {
+  this.summary = Economy.finishOrder(this.order, this.results);
+  this.state = 'result';
+  this.overlayT = 0;
+  this.main.toast.life = 0;
+  this.coinShown = 0;
+  this.targetCoins = this.summary.coins;
+  this.doubled = false;
+  this.dragging = false;
+  Sound.star();
+  Platform.haptic('heavy');
+  Platform.reportEvent('result_show', { order: this.order.index, grade: this.summary.grade.key });
+};
+
+PlayScene.prototype.doubleResult = function () {
+  if (this.doubled || !this.summary) return;
+  var self = this;
+  this.main.rewarded('result_double', function () {
+    Economy.addCoins(self.summary.coins);
+    self.doubled = true;
+    self.targetCoins = self.summary.coins * 2;
+    Sound.coin();
+    self.main.notify('结算金币翻倍 +' + self.summary.coins);
+  });
+};
+
+PlayScene.prototype.leaveTo = function (where) {
+  if (this.leaving) return;
+  this.leaving = true;
+  var main = this.main;
+  if (this.potato) this.potato.dispose();
+  main.maybeInterstitial(function () {
+    if (where === 'next') main.startOrder();
+    else main.toMenu();
+  });
+};
+
+PlayScene.prototype.fail = function () {
+  if (this.state !== 'play') return;
+  this.state = 'fail';
+  this.overlayT = 0;
+  this.dragging = false;
+  this.timerStarted = false;
+  Sound.fail();
+  Platform.haptic('heavy');
+  Economy.failOrder(this.order);
+};
+
+PlayScene.prototype.revive = function () {
+  if (this.revived) { this.main.notify('本单已经加过时了'); return; }
+  var self = this;
+  this.main.rewarded('fail_revive', function () {
+    self.revived = true;
+    self.timeLeft += 15;
+    self.state = 'play';
+    self.timerStarted = true;
+    self.main.notify('加时 15 秒，继续削！');
+  });
+};
+
+PlayScene.prototype.update = function (dt) {
+  this.t += dt;
+  if (this.potato) {
+    if (this.potato.introT < 1) this.potato.introT = Math.min(1, this.potato.introT + dt * 3.4);
+    if (this.state === 'serving') {
+      this.potato.goneT = Math.min(1, this.potato.goneT + dt * 2.6);
+    }
+  }
+  this.fx.update(dt);
+  if (this.wasteFlash > 0) this.wasteFlash = Math.max(0, this.wasteFlash - dt * 1.6);
+  if (this.peelHapticT > 0) this.peelHapticT -= dt;
+  if (this.wasteTextT > 0) this.wasteTextT -= dt;
+  if (this.hintT < 99) this.hintT += dt;
+
+  if (this.state === 'play' && this.timerStarted) {
+    this.timeLeft -= dt;
+    if (this.timeLeft <= 0) {
+      this.timeLeft = 0;
+      this.fail();
+    }
+  }
+
+  if (this.state === 'serving') {
+    this.serveT += dt;
+    if (this.serveT >= 0.62) {
+      if (this.index + 1 < this.order.count) {
+        this.index += 1;
+        this.spawnPotato(this.index);
+        this.state = 'play';
+      } else {
+        this.completeOrder();
+      }
+    }
+  }
+
+  if (this.state === 'result') {
+    this.overlayT = Math.min(1, this.overlayT + dt * 4);
+    var target = this.targetCoins || 0;
+    this.coinShown += (target - this.coinShown) * Math.min(1, dt * 6);
+    if (Math.abs(target - this.coinShown) < 0.6) this.coinShown = target;
+  } else if (this.state === 'fail' || this.state === 'paused' || this.state === 'tutorial') {
+    this.overlayT = Math.min(1, this.overlayT + dt * 5);
+  }
+};
+
+PlayScene.prototype.render = function (ctx) {
+  // 3D 模式：跳过 drawBackground / drawBoard（让 3D 层背景透出来），
+  // UI canvas 默认透明，只有 HUD/按钮/FX 是不透明的 → 直接看见 3D 土豆
+  if (this._3d) {
+    ctx.clearRect(0, 0, this.W, this.H);
+    // 轻微的顶光装饰（不遮挡 3D 主体）
+    var lg = ctx.createRadialGradient(this.cx, this.safeTop + 20, 4, this.cx, this.cy, this.R * 2);
+    lg.addColorStop(0, 'rgba(255,248,220,0.18)');
+    lg.addColorStop(1, 'rgba(255,248,220,0)');
+    ctx.fillStyle = lg;
+    ctx.fillRect(0, 0, this.W, this.H);
+  } else {
+    this.drawBackground(ctx);
+    this.drawBoard(ctx);
+    if (this.potato) this.potato.render(ctx, this.t);
+  }
+
+  this.fx.render(ctx);
+  this.drawHUD(ctx);
+  this.drawProgress(ctx);
+  this.drawHint(ctx);
+  this.drawCompleteButton(ctx);
+
+  // 工具选择 UI（3D 模式才显示）
+  if (this._3d) this.drawToolBar(ctx);
+
+  if (this.state === 'tutorial') this.drawTutorial(ctx);
+  else if (this.state === 'paused') this.drawPause(ctx);
+  else if (this.state === 'fail') this.drawFail(ctx);
+  else if (this.state === 'result') this.drawResult(ctx);
+
+  if (this.wasteFlash > 0) {
+    ctx.fillStyle = 'rgba(217,105,79,' + (this.wasteFlash * 0.16) + ')';
+    ctx.fillRect(0, 0, this.W, this.H);
+  }
+};
+
+PlayScene.prototype.drawBackground = function (ctx) {
+  var W = this.W;
+  var H = this.H;
+  var wallH = H * 0.66;
+
+  var bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#F8E9C8');
+  bg.addColorStop(0.6, '#EFDAB2');
+  bg.addColorStop(1, '#D8B983');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.globalAlpha = 0.42;
+  ctx.strokeStyle = '#E0C69A';
+  ctx.lineWidth = 1;
+  var tile = Math.max(40, W / 9);
+  for (var x = 0; x < W; x += tile) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, wallH); ctx.stroke();
+  }
+  for (var y = 0; y < wallH; y += tile) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  ctx.restore();
+
+  // 顶灯光锥
+  var lg = ctx.createRadialGradient(this.cx, this.safeTop + 20, 8, this.cx, this.cy, this.R * 2.4);
+  lg.addColorStop(0, 'rgba(255,248,220,0.6)');
+  lg.addColorStop(1, 'rgba(255,248,220,0)');
+  ctx.fillStyle = lg;
+  ctx.fillRect(0, 0, W, H);
+
+  // 台面
+  var cg = ctx.createLinearGradient(0, wallH, 0, H);
+  cg.addColorStop(0, '#C99159');
+  cg.addColorStop(0.1, '#B57C46');
+  cg.addColorStop(1, '#8A5629');
+  ctx.fillStyle = cg;
+  ctx.fillRect(0, wallH, W, H - wallH);
+  ctx.fillStyle = 'rgba(255,236,200,0.28)';
+  ctx.fillRect(0, wallH, W, 2);
+
+  // 木纹
+  ctx.save();
+  ctx.globalAlpha = 0.12;
+  ctx.strokeStyle = '#5E3A18';
+  ctx.lineWidth = 1.2;
+  for (var i = 0; i < 6; i++) {
+    var yy = wallH + 30 + i * 40;
+    ctx.beginPath();
+    ctx.moveTo(0, yy);
+    ctx.bezierCurveTo(W * 0.3, yy - 5, W * 0.65, yy + 6, W, yy - 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // 墙上的配额牌
+  var sx = W - 92;
+  var sy = this.safeTop + 78;
+  ctx.save();
+  ctx.globalAlpha = 0.6;
+  UI.fillRR(ctx, sx, sy, 74, 50, 8, '#F6E3BC');
+  UI.strokeRR(ctx, sx, sy, 74, 50, 8, 'rgba(126,90,56,0.45)', 1.4);
+  UI.text(ctx, '今日配额', sx + 37, sy + 15, 8, T.inkSoft, 'center', 700);
+  UI.text(ctx, this.order.count + ' 颗', sx + 37, sy + 32, 14, T.ink, 'center', 900);
+  ctx.restore();
+
+  // 小桶
+  var bx = W - 52;
+  var by = this.boardY + this.R * 0.32;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(bx - 20, by - 20);
+  ctx.lineTo(bx + 20, by - 20);
+  ctx.lineTo(bx + 15, by + 22);
+  ctx.lineTo(bx - 15, by + 22);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(120,78,34,0.75)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(70,40,15,0.4)';
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(bx, by - 20, 20, Math.PI, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(70,40,15,0.35)';
+  ctx.stroke();
+  for (var k = 0; k < this.results.length; k++) {
+    ctx.beginPath();
+    ctx.ellipse ? ctx.ellipse(bx - 8 + (k % 3) * 8, by - 18 + (k % 2) * 4, 7, 5, 0.2, 0, Math.PI * 2) :
+      ctx.arc(bx - 8 + (k % 3) * 8, by - 18, 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#F8E6B4';
+    ctx.fill();
+  }
+  UI.text(ctx, '已入桶 ' + this.results.length, bx, by + 34, 8.5, 'rgba(255,244,214,0.85)', 'center', 700);
+  ctx.restore();
+};
+
+PlayScene.prototype.drawBoard = function (ctx) {
+  var cx = this.cx;
+  var by = this.boardY;
+  var rx = this.R * 1.48;
+  var ry = this.R * 0.48;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(cx, by + 8, rx * 1.02, ry * 0.95, 0, 0, Math.PI * 2) :
+    ctx.arc(cx, by + 8, rx * 0.7, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(60,34,12,0.22)';
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(cx, by, rx, ry, 0, 0, Math.PI * 2) : ctx.arc(cx, by, rx * 0.7, 0, Math.PI * 2);
+  var g = ctx.createLinearGradient(cx - rx, by - ry, cx + rx, by + ry);
+  g.addColorStop(0, '#D6A067');
+  g.addColorStop(0.5, '#C08A50');
+  g.addColorStop(1, '#9A6738');
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(90,52,20,0.35)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // 年轮
+  ctx.save();
+  ctx.globalAlpha = 0.18;
+  ctx.strokeStyle = '#6E4520';
+  ctx.lineWidth = 1;
+  for (var i = 1; i <= 3; i++) {
+    ctx.beginPath();
+    ctx.ellipse ? ctx.ellipse(cx, by, rx * (0.25 + i * 0.18), ry * (0.25 + i * 0.18), 0, 0, Math.PI * 2) :
+      ctx.arc(cx, by, rx * 0.4, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+  ctx.restore();
+};
+
+PlayScene.prototype.drawHUD = function (ctx) {
+  var W = this.W;
+  var st = this.safeTop;
+
+  // 暂停
+  UI.button(ctx, UI.makeButton({
+    x: this.pauseBtn.x, y: this.pauseBtn.y, w: 42, h: 42, kind: 'icon', radius: 13,
+    icon: 'pause', iconSize: 17
+  }));
+
+  // 订单
+  var ow = 136;
+  var ox = (W - ow) / 2;
+  UI.pill(ctx, ox, st + 12, ow, 38, 'rgba(255,248,232,0.94)', 'rgba(150,103,52,0.28)');
+  UI.text(ctx, '第 ' + this.order.index + ' 单 · ' + (this.index + 1) + '/' + this.order.count, ox + ow / 2, st + 31, 13, T.ink, 'center', 800);
+
+  // 计时
+  var tw = 88;
+  var tx = W - 16 - tw;
+  var low = this.timeLeft <= 15;
+  UI.pill(ctx, tx, st + 12, tw, 38, low ? 'rgba(217,105,79,0.16)' : 'rgba(255,248,232,0.94)', low ? 'rgba(217,105,79,0.55)' : 'rgba(150,103,52,0.28)');
+  UI.drawIcon(ctx, 'clock', tx + 18, st + 31, 15, low ? T.red : T.inkSoft);
+  UI.text(ctx, fmtTime(this.timeLeft), tx + tw - 12, st + 31, 15, low ? T.red : T.ink, 'right', 800);
+
+  // 金土豆
+  if (this.currentGolden) {
+    var gw = 146;
+    var gx = (W - gw) / 2;
+    var gy = st + 58;
+    UI.pill(ctx, gx, gy, gw, 24, 'rgba(242,184,75,0.9)');
+    UI.text(ctx, '金土豆 · 需削净 95%', gx + gw / 2, gy + 12, 10, '#5E3A12', 'center', 800);
+  }
+};
+
+PlayScene.prototype.drawProgress = function (ctx) {
+  var x = this.progressX;
+  var y = this.progressY;
+  var w = this.progressW;
+  var h = this.progressH;
+  var p = this.potato ? this.potato.progress() : 0;
+  var target = this.currentTarget || this.order.target;
+  var waste = this.potato ? this.potato.waste() : 0;
+  var done = p >= target;
+
+  UI.fillRR(ctx, x, y, w, h, 16, 'rgba(255,248,232,0.95)');
+  UI.strokeRR(ctx, x, y, w, h, 16, done ? 'rgba(242,184,75,0.85)' : 'rgba(150,103,52,0.24)', done ? 2 : 1.2);
+
+  UI.text(ctx, '削净', x + 16, y + 15, 10, T.inkSoft, 'left', 700);
+  UI.text(ctx, Math.round(p * 100) + '%', x + 16, y + 34, 19, done ? T.greenDark : T.ink, 'left', 900);
+  UI.text(ctx, '目标 ' + Math.round(target * 100) + '%' + (done ? ' · 已达标' : ''), x + 82, y + 35, 9,
+    done ? T.greenDark : T.inkSoft, 'left', done ? 800 : 600);
+
+  UI.text(ctx, '浪费', x + w - 16, y + 15, 10, T.inkSoft, 'right', 700);
+  UI.text(ctx, (waste * 100).toFixed(1) + '%', x + w - 16, y + 34, 16, waste > 0.04 ? T.red : T.ink, 'right', 900);
+
+  UI.bar(ctx, x + 16, y + 51, w - 32, 6, p, done ? T.gold : T.green, 'rgba(126,90,56,0.14)', 3);
+  var tx = x + 16 + (w - 32) * target;
+  ctx.beginPath();
+  ctx.moveTo(tx, y + 48);
+  ctx.lineTo(tx, y + 60);
+  ctx.strokeStyle = 'rgba(94,58,28,0.75)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+};
+
+PlayScene.prototype.drawHint = function (ctx) {
+  var W = this.W;
+  var y = this.progressY + this.progressH + 20;
+  if (this.hintT > 4.2 && this.timerStarted) return;
+  var text = this.timerStarted ? '别反复刮同一处，浪费会拉低评级' : '按住土豆，来回滑动开始削皮';
+  var w = UI.measure(ctx, text, 11, 700) + 44;
+  var x = (W - w) / 2;
+  ctx.save();
+  ctx.globalAlpha = this.timerStarted ? Math.max(0, 1 - (this.hintT - 2.4) / 1.8) : 0.9;
+  UI.pill(ctx, x, y, w, 30, 'rgba(255,248,232,0.72)');
+  UI.drawIcon(ctx, 'hand', x + 18, y + 15, 14, T.inkSoft);
+  UI.text(ctx, text, x + 30, y + 15, 11, T.inkSoft, 'left', 700);
+  ctx.restore();
+};
+
+PlayScene.prototype.drawCompleteButton = function (ctx) {
+  if (!this.canComplete()) return;
+  var b = UI.makeButton({
+    x: this.completeBtn.x, y: this.completeBtn.y, w: this.completeBtn.w, h: this.completeBtn.h,
+    radius: 16, label: '完成这颗', kind: 'primary', size: 18
+  });
+  b.pressed = this.pressedAction === 'complete';
+  var pulse = 1 + Math.sin(this.t * 4) * 0.015;
+  ctx.save();
+  ctx.translate(b.x + b.w / 2, b.y + b.h / 2);
+  ctx.scale(pulse, pulse);
+  ctx.translate(-(b.x + b.w / 2), -(b.y + b.h / 2));
+  UI.button(ctx, b);
+  ctx.restore();
+};
+
+PlayScene.prototype.drawToolBar = function (ctx) {
+  var tools = this.toolBtns;
+  for (var i = 0; i < tools.length; i++) {
+    var b = tools[i];
+    var selected = this._tool === b.id;
+    var cx = b.x + b.w / 2;
+    var cy = b.y + b.h / 2;
+
+    // 背景胶囊
+    ctx.save();
+    ctx.shadowColor = selected ? 'rgba(244,220,180,0.5)' : 'rgba(0,0,0,0.3)';
+    ctx.shadowBlur = selected ? 14 : 8;
+    ctx.shadowOffsetY = 2;
+    UI.fillRR(ctx, b.x, b.y, b.w, b.h, 14, selected ? '#FFE6B0' : '#3D2A1C');
+    ctx.restore();
+
+    // 选中描边
+    if (selected) {
+      ctx.strokeStyle = '#FF9A3C';
+      ctx.lineWidth = 2.5;
+      UI.strokeRR(ctx, b.x, b.y, b.w, b.h, 14);
+    }
+
+    // 图标
+    ctx.fillStyle = selected ? '#8B4513' : '#FFE6B0';
+    if (b.id === 'knife') {
+      // 削皮刀：一把小刀（三角形+刀柄）
+      ctx.save();
+      ctx.translate(cx - 6, cy + 8);
+      ctx.rotate(-0.5);
+      ctx.beginPath();
+      ctx.moveTo(0, 0); ctx.lineTo(20, -6); ctx.lineTo(20, 0); ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      ctx.fillRect(cx + 8, cy + 4, 10, 4);
+    } else if (b.id === 'fork') {
+      // 叉子
+      ctx.save();
+      ctx.translate(cx, cy - 8);
+      ctx.strokeStyle = selected ? '#8B4513' : '#FFE6B0';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(-10, 0); ctx.lineTo(-10, 18); ctx.moveTo(-3, 0); ctx.lineTo(-3, 18); ctx.moveTo(4, 0); ctx.lineTo(4, 18); ctx.moveTo(11, 0); ctx.lineTo(11, 18); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-14, 18); ctx.lineTo(14, 18); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, 18); ctx.lineTo(0, 30); ctx.stroke();
+      ctx.restore();
+    } else if (b.id === 'grater') {
+      // 刨丝器（波浪 + 底部细丝）
+      ctx.beginPath();
+      ctx.moveTo(cx - 16, cy + 12);
+      for (var g = 0; g < 6; g++) {
+        ctx.lineTo(cx - 16 + g * 5.3, cy + 12 + Math.sin(g * 1.2) * -10);
+      }
+      ctx.lineTo(cx + 16, cy + 12);
+      ctx.strokeStyle = selected ? '#8B4513' : '#FFE6B0';
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+      ctx.beginPath();
+      for (var f = 0; f < 5; f++) {
+        var fx2 = cx - 14 + f * 7;
+        ctx.moveTo(fx2, cy + 12);
+        ctx.lineTo(fx2 + 1, cy + 20);
+      }
+      ctx.stroke();
+    }
+
+    // 标签
+    ctx.fillStyle = selected ? '#5C2C0C' : '#DDBE8B';
+    ctx.font = 'bold 10px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(b.label, cx, b.y + b.h + 14);
+  }
+};
+
+PlayScene.prototype.drawTutorial = function (ctx) {
+  var c = this.tutorialCard;
+  var k = easeOutBack(this.overlayT);
+  UI.dim(ctx, this.W, this.H, 0.62);
+  ctx.save();
+  ctx.translate(c.x + c.w / 2, c.y + c.h / 2);
+  ctx.scale(0.9 + 0.1 * k, 0.9 + 0.1 * k);
+  ctx.translate(-(c.x + c.w / 2), -(c.y + c.h / 2));
+  UI.shadow(ctx, 'rgba(0,0,0,0.35)', 24, 0, 10);
+  UI.fillRR(ctx, c.x, c.y, c.w, c.h, 22, '#FFF8E8');
+  UI.clearShadow(ctx);
+
+  UI.text(ctx, '削土豆，先学三招', c.x + c.w / 2, c.y + 34, 20, T.ink, 'center', 900);
+
+  // 手势图示
+  var gx = c.x + c.w / 2;
+  var gy = c.y + 90;
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(gx, gy, 54, 34, 0, 0, Math.PI * 2) : ctx.arc(gx, gy, 42, 0, Math.PI * 2);
+  ctx.fillStyle = '#B0743E';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(gx - 12, gy + 6, 22, 14, 0, 0, Math.PI * 2) : ctx.arc(gx - 12, gy + 6, 18, 0, Math.PI * 2);
+  ctx.fillStyle = '#F8E6B4';
+  ctx.fill();
+  var slide = Math.sin(this.t * 3) * 26;
+  UI.drawIcon(ctx, 'hand', gx + slide, gy - 38, 28, '#B98556');
+  ctx.beginPath();
+  ctx.moveTo(gx - 38, gy - 32);
+  ctx.lineTo(gx + 38, gy - 32);
+  ctx.strokeStyle = 'rgba(126,90,56,0.3)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash ? ctx.setLineDash([5, 5]) : null;
+  ctx.stroke();
+  if (ctx.setLineDash) ctx.setLineDash([]);
+
+  var lines = [
+    '按住土豆，来回滑动削皮',
+    '别反复刮同一处，果肉会浪费',
+    '削净达到目标，点「完成这颗」'
+  ];
+  for (var i = 0; i < lines.length; i++) {
+    var ly = c.y + 150 + i * 32;
+    ctx.beginPath();
+    ctx.arc(c.x + 32, ly, 10, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(111,168,94,0.18)';
+    ctx.fill();
+    UI.text(ctx, String(i + 1), c.x + 32, ly, 10, T.greenDark, 'center', 800);
+    UI.text(ctx, lines[i], c.x + 50, ly, 12, T.ink, 'left', 700);
+  }
+
+  var b = UI.makeButton({
+    x: this.tutorialBtn.x, y: this.tutorialBtn.y, w: this.tutorialBtn.w, h: this.tutorialBtn.h,
+    radius: 15, label: '开始削皮', kind: 'primary', size: 16
+  });
+  b.pressed = this.pressedAction === 'tutorialStart';
+  UI.button(ctx, b);
+  UI.text(ctx, '第一次上岗不计时', c.x + c.w / 2, c.y + c.h - 10, 9, T.inkSoft, 'center', 600);
+  ctx.restore();
+};
+
+PlayScene.prototype.drawPause = function (ctx) {
+  var c = this.pauseCard;
+  var k = easeOutBack(this.overlayT);
+  UI.dim(ctx, this.W, this.H, 0.6);
+  ctx.save();
+  ctx.translate(c.x + c.w / 2, c.y + c.h / 2);
+  ctx.scale(0.92 + 0.08 * k, 0.92 + 0.08 * k);
+  ctx.translate(-(c.x + c.w / 2), -(c.y + c.h / 2));
+  UI.shadow(ctx, 'rgba(0,0,0,0.35)', 24, 0, 10);
+  UI.fillRR(ctx, c.x, c.y, c.w, c.h, 22, '#FFF8E8');
+  UI.clearShadow(ctx);
+
+  UI.text(ctx, '暂停', c.x + c.w / 2, c.y + 52, 24, T.ink, 'center', 900);
+  UI.text(ctx, '军需处也需要喘口气', c.x + c.w / 2, c.y + 86, 11, T.inkSoft, 'center', 600);
+  UI.text(ctx, '第 ' + this.order.index + ' 单 · ' + this.results.length + '/' + this.order.count + ' 颗已完成', c.x + c.w / 2, c.y + 110, 10, T.inkSoft, 'center', 600);
+
+  var b1 = UI.makeButton({ x: this.pauseResumeBtn.x, y: this.pauseResumeBtn.y, w: this.pauseResumeBtn.w, h: this.pauseResumeBtn.h, radius: 15, label: '继续削', kind: 'primary', size: 16 });
+  b1.pressed = this.pressedAction === 'resume';
+  UI.button(ctx, b1);
+  var b2 = UI.makeButton({ x: this.pauseRestartBtn.x, y: this.pauseRestartBtn.y, w: this.pauseRestartBtn.w, h: this.pauseRestartBtn.h, radius: 14, label: '重新开始本单', kind: 'secondary', size: 13 });
+  b2.pressed = this.pressedAction === 'restart';
+  UI.button(ctx, b2);
+  var b3 = UI.makeButton({ x: this.pauseHomeBtn.x, y: this.pauseHomeBtn.y, w: this.pauseHomeBtn.w, h: this.pauseHomeBtn.h, radius: 12, label: '回大厅', kind: 'secondary', size: 12 });
+  b3.pressed = this.pressedAction === 'home';
+  UI.button(ctx, b3);
+  ctx.restore();
+};
+
+PlayScene.prototype.drawFail = function (ctx) {
+  var c = this.failCard;
+  var k = easeOutBack(this.overlayT);
+  UI.dim(ctx, this.W, this.H, 0.62);
+  ctx.save();
+  ctx.translate(c.x + c.w / 2, c.y + c.h / 2);
+  ctx.scale(0.92 + 0.08 * k, 0.92 + 0.08 * k);
+  ctx.translate(-(c.x + c.w / 2), -(c.y + c.h / 2));
+  UI.shadow(ctx, 'rgba(0,0,0,0.4)', 24, 0, 10);
+  UI.fillRR(ctx, c.x, c.y, c.w, c.h, 22, '#FFF8E8');
+  UI.clearShadow(ctx);
+
+  ctx.beginPath();
+  ctx.arc(c.x + c.w / 2, c.y + 56, 28, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(217,105,79,0.14)';
+  ctx.fill();
+  UI.drawIcon(ctx, 'clock', c.x + c.w / 2, c.y + 56, 26, T.red);
+
+  UI.text(ctx, '时间到！', c.x + c.w / 2, c.y + 102, 22, T.ink, 'center', 900);
+  UI.text(ctx, '军需官盯着空桶，眉头皱了起来。', c.x + c.w / 2, c.y + 126, 10.5, T.inkSoft, 'center', 600);
+  UI.text(ctx, '已完成 ' + this.results.length + '/' + this.order.count + ' 颗', c.x + c.w / 2, c.y + 145, 12, T.ink, 'center', 800);
+
+  var b1 = UI.makeButton({
+    x: this.failReviveBtn.x, y: this.failReviveBtn.y, w: this.failReviveBtn.w, h: this.failReviveBtn.h,
+    radius: 14, label: this.revived ? '本单已加时' : '看视频 · 加时 15 秒',
+    kind: this.revived ? 'secondary' : 'gold', size: 14, enabled: !this.revived
+  });
+  b1.pressed = this.pressedAction === 'revive';
+  UI.button(ctx, b1);
+  var b2 = UI.makeButton({ x: this.failRestartBtn.x, y: this.failRestartBtn.y, w: this.failRestartBtn.w, h: this.failRestartBtn.h, radius: 14, label: '重新挑战', kind: 'primary', size: 14 });
+  b2.pressed = this.pressedAction === 'restart';
+  UI.button(ctx, b2);
+  var b3 = UI.makeButton({ x: this.failHomeBtn.x, y: this.failHomeBtn.y, w: this.failHomeBtn.w, h: this.failHomeBtn.h, radius: 12, label: '回大厅', kind: 'secondary', size: 12 });
+  b3.pressed = this.pressedAction === 'home';
+  UI.button(ctx, b3);
+  ctx.restore();
+};
+
+PlayScene.prototype.drawResult = function (ctx) {
+  var c = this.resultCard;
+  var k = easeOutBack(this.overlayT);
+  var s = this.summary;
+  if (!s) return;
+
+  UI.dim(ctx, this.W, this.H, 0.66);
+  ctx.save();
+  ctx.translate(c.x + c.w / 2, c.y + c.h / 2);
+  ctx.scale(0.92 + 0.08 * k, 0.92 + 0.08 * k);
+  ctx.translate(-(c.x + c.w / 2), -(c.y + c.h / 2));
+  UI.shadow(ctx, 'rgba(0,0,0,0.45)', 30, 0, 12);
+  UI.fillRR(ctx, c.x, c.y, c.w, c.h, 24, '#FFF8E8');
+  UI.clearShadow(ctx);
+
+  UI.text(ctx, '军需处验收', c.x + c.w / 2, c.y + 24, 10, T.inkSoft, 'center', 700);
+  UI.text(ctx, '本单完成', c.x + c.w / 2, c.y + 48, 21, T.ink, 'center', 900);
+
+  // 评级
+  var gx = c.x + c.w / 2;
+  var gy = c.y + 100;
+  ctx.save();
+  ctx.translate(gx, gy);
+  ctx.rotate(-0.1);
+  ctx.beginPath();
+  ctx.arc(0, 0, 34, 0, Math.PI * 2);
+  ctx.fillStyle = s.grade.color;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(0, 0, 27, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  UI.text(ctx, s.grade.key, 0, 1, 34, '#FFFDF4', 'center', 900);
+  ctx.restore();
+  UI.text(ctx, s.grade.name + ' · 平均浪费 ' + (s.avgWaste * 100).toFixed(1) + '%', gx, gy + 52, 12, T.ink, 'center', 800);
+  if (s.perfectRun) {
+    UI.pill(ctx, gx - 62, gy + 64, 124, 22, 'rgba(242,184,75,0.2)');
+    UI.text(ctx, '完美手感 · 收益 +12%', gx, gy + 75, 9.5, T.goldDark, 'center', 800);
+  }
+
+  // 统计
+  var rowY = c.y + 208;
+  var rows = [
+    { label: '完成土豆', value: this.results.length + ' / ' + this.order.count + ' 颗' },
+    { label: 'S 评级', value: s.sCount + ' 颗' },
+    { label: '木桶加成', value: '+' + Math.round((s.coinMul - 1) * 100) + '%' }
+  ];
+  for (var i = 0; i < rows.length; i++) {
+    UI.text(ctx, rows[i].label, c.x + 26, rowY + i * 24, 11, T.inkSoft, 'left', 600);
+    UI.text(ctx, rows[i].value, c.x + c.w - 26, rowY + i * 24, 11, T.ink, 'right', 800);
+  }
+
+  // 金币
+  UI.text(ctx, '土豆币', c.x + c.w / 2 - 34, c.y + 284, 10, T.inkSoft, 'center', 600);
+  UI.drawCoin(ctx, c.x + c.w / 2 - 34, c.y + 304, 10);
+  UI.text(ctx, '+' + Math.round(this.coinShown), c.x + c.w / 2 + 14, c.y + 304, 22, T.goldDark, 'center', 900);
+
+  var bDouble = UI.makeButton({
+    x: this.resultDoubleBtn.x, y: this.resultDoubleBtn.y, w: this.resultDoubleBtn.w, h: this.resultDoubleBtn.h,
+    radius: 13, label: this.doubled ? '已领取双倍' : '看视频 · 金币翻倍 +' + s.coins,
+    kind: this.doubled ? 'secondary' : 'gold', size: 12, enabled: !this.doubled
+  });
+  bDouble.pressed = this.pressedAction === 'double';
+  UI.button(ctx, bDouble);
+
+  var bNext = UI.makeButton({
+    x: this.resultNextBtn.x, y: this.resultNextBtn.y, w: this.resultNextBtn.w, h: this.resultNextBtn.h,
+    radius: 15, label: '下 一 单', kind: 'primary', size: 17
+  });
+  bNext.pressed = this.pressedAction === 'next';
+  UI.button(ctx, bNext);
+
+  var bHome = UI.makeButton({
+    x: this.resultHomeBtn.x, y: this.resultHomeBtn.y, w: this.resultHomeBtn.w, h: this.resultHomeBtn.h,
+    radius: 11, label: '回大厅', kind: 'secondary', size: 11.5
+  });
+  bHome.pressed = this.pressedAction === 'home';
+  UI.button(ctx, bHome);
+  ctx.restore();
+};
+
+PlayScene.prototype.onEscape = function () {
+  if (this.state === 'play') this.openPause();
+  else if (this.state === 'paused') this.state = 'play';
+  else if (this.state === 'tutorial') this.startTutorial();
+};
+
+module.exports = PlayScene;
+
+};
+__defs["potato"] = function(module, exports, require){
+/**
+ * 土豆：不规则轮廓 + 皮肤图层擦除 + 果肉浪费深度。
+ * 用低分辨率网格统计削净率，避免每帧读像素。
+ */
+var Platform = require('./platform');
+var CONFIG = require('./config');
+
+function rng(seed) {
+  var s = seed >>> 0;
+  return function () {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+function Potato(opts) {
+  this.cx = opts.cx;
+  this.cy = opts.cy;
+  this.R = opts.R;
+  this.dpr = opts.dpr || 1;
+  this.golden = !!opts.golden;
+  this.target = opts.target || 0.86;
+  this.brush = opts.brush || 17;
+  this.wasteThreshold = Math.max(8, Math.round(opts.wasteDepth || 26));
+  this.seed = (opts.seed || Math.floor(Math.random() * 1e9)) >>> 0;
+  this.rand = rng(this.seed);
+  this.xScale = 1.06;
+  this.yScale = 0.94;
+  this.variant = Math.floor(this.rand() * 3);
+
+  this.buildRadius();
+  this.buildGrid();
+  this.buildSkin();
+  this.buildFleshBlobs();
+
+  this.peeledCells = 0;
+  this.wasteCells = 0;
+  this.lastX = null;
+  this.lastY = null;
+  this.completed = false;
+  this.introT = 0;
+  this.goneT = 0;
+  this.sparkT = 0;
+}
+
+Potato.prototype.buildRadius = function () {
+  var N = 240;
+  this.radTable = new Float32Array(N);
+  this.radN = N;
+  var p1 = this.rand() * 6.28;
+  var p2 = this.rand() * 6.28;
+  var p3 = this.rand() * 6.28;
+  for (var i = 0; i < N; i++) {
+    var th = i / N * Math.PI * 2;
+    var r = 1 +
+      0.052 * Math.sin(th * 3 + p1) +
+      0.03 * Math.sin(th * 5 + p2) +
+      0.017 * Math.sin(th * 7 + p3) +
+      0.012 * Math.sin(th * 2 + p1 * 0.7);
+    this.radTable[i] = r;
+  }
+};
+
+Potato.prototype.radiusAt = function (theta) {
+  var a = theta % (Math.PI * 2);
+  if (a < 0) a += Math.PI * 2;
+  var i = Math.floor(a / (Math.PI * 2) * this.radN) % this.radN;
+  return this.radTable[i];
+};
+
+Potato.prototype.isInside = function (x, y) {
+  var u = (x - this.cx) / (this.R * this.xScale);
+  var v = (y - this.cy) / (this.R * this.yScale);
+  var d2 = u * u + v * v;
+  if (d2 > 1.25) return false;
+  var d = Math.sqrt(d2);
+  if (d < 0.00001) return true;
+  return d <= this.radiusAt(Math.atan2(v, u));
+};
+
+Potato.prototype.buildGrid = function () {
+  var N = CONFIG.play.grid;
+  this.gw = N;
+  this.gh = N;
+  this.bw = this.R * 2 * this.xScale * 1.13;
+  this.bh = this.R * 2 * this.yScale * 1.13;
+  this.bx0 = this.cx - this.bw / 2;
+  this.by0 = this.cy - this.bh / 2;
+  this.cw = this.bw / N;
+  this.ch = this.bh / N;
+  this.inside = new Uint8Array(N * N);
+  this.state = new Uint8Array(N * N);
+  this.depth = new Uint8Array(N * N);
+  this.insideTotal = 0;
+  this.skinTotal = 0;
+  for (var gy = 0; gy < N; gy++) {
+    for (var gx = 0; gx < N; gx++) {
+      var px = this.bx0 + (gx + 0.5) * this.cw;
+      var py = this.by0 + (gy + 0.5) * this.ch;
+      var idx = gy * N + gx;
+      if (this.isInside(px, py)) {
+        this.inside[idx] = 1;
+        this.state[idx] = 1;
+        this.insideTotal++;
+        this.skinTotal++;
+      }
+    }
+  }
+};
+
+Potato.prototype.shapePath = function (ctx, scale, ox, oy) {
+  var N = 120;
+  ox = ox || 0;
+  oy = oy || 0;
+  ctx.beginPath();
+  for (var i = 0; i <= N; i++) {
+    var th = i / N * Math.PI * 2;
+    var r = this.radiusAt(th) * (scale || 1);
+    var x = ox + Math.cos(th) * this.R * this.xScale * r;
+    var y = oy + Math.sin(th) * this.R * this.yScale * r;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+};
+
+Potato.prototype.skinColors = function () {
+  if (this.golden) {
+    return { top: '#F5D06B', mid: '#E2AC3F', bottom: '#B97C1F', edge: '#8A5A12' };
+  }
+  if (this.variant === 1) {
+    return { top: '#C98A5D', mid: '#A85C3C', bottom: '#7E3E27', edge: '#5E2B17' };
+  }
+  if (this.variant === 2) {
+    return { top: '#D5B073', mid: '#B98D4F', bottom: '#8E6532', edge: '#6A471E' };
+  }
+  return { top: '#C98F5B', mid: '#B0743E', bottom: '#82501F', edge: '#5F3714' };
+};
+
+Potato.prototype.buildSkin = function () {
+  var SS = this.R * 2.5;
+  this.SS = SS;
+  this.skinSize = Math.ceil(SS * this.dpr);
+  this.skin = Platform.createOffscreen(this.skinSize, this.skinSize);
+  var ctx = this.skin.getContext('2d');
+  var hasTransform = ctx.setTransform;
+  if (hasTransform) ctx.setTransform(this.dpr, 0, 0, this.dpr, this.skinSize / 2, this.skinSize / 2);
+  else { ctx.translate(this.skinSize / 2, this.skinSize / 2); ctx.scale(this.dpr, this.dpr); }
+
+  var colors = this.skinColors();
+  ctx.save();
+  this.shapePath(ctx, 1);
+  ctx.clip();
+
+  var g = ctx.createLinearGradient(-this.R, -this.R, this.R * 0.9, this.R);
+  g.addColorStop(0, colors.top);
+  g.addColorStop(0.5, colors.mid);
+  g.addColorStop(1, colors.bottom);
+  ctx.fillStyle = g;
+  ctx.fillRect(-SS, -SS, SS * 2, SS * 2);
+
+  // 皮面颗粒
+  for (var i = 0; i < 210; i++) {
+    var a = this.rand() * Math.PI * 2;
+    var d = Math.sqrt(this.rand()) * 1.02;
+    var x = Math.cos(a) * this.R * this.xScale * d;
+    var y = Math.sin(a) * this.R * this.yScale * d;
+    var sz = 0.5 + this.rand() * 1.9;
+    ctx.beginPath();
+    ctx.arc(x, y, sz, 0, Math.PI * 2);
+    ctx.fillStyle = this.rand() > 0.5 ? 'rgba(255,235,190,0.18)' : 'rgba(70,38,12,0.18)';
+    ctx.fill();
+  }
+  // 深色芽眼
+  var eyes = 5 + Math.floor(this.rand() * 5);
+  for (var e = 0; e < eyes; e++) {
+    var ea = this.rand() * Math.PI * 2;
+    var ed = Math.sqrt(this.rand()) * 0.92;
+    var ex = Math.cos(ea) * this.R * this.xScale * ed;
+    var ey = Math.sin(ea) * this.R * this.yScale * ed;
+    var er = 1.5 + this.rand() * 3.2;
+    ctx.beginPath();
+    ctx.ellipse ? ctx.ellipse(ex, ey, er * 1.25, er, this.rand() * 3, 0, Math.PI * 2) : ctx.arc(ex, ey, er, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(70,38,12,0.55)';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(ex - er * 0.25, ey - er * 0.25, er * 0.42, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,230,180,0.35)';
+    ctx.fill();
+  }
+
+  // 边缘暗部
+  this.shapePath(ctx, 0.995);
+  ctx.lineWidth = this.R * 0.12;
+  ctx.strokeStyle = this.golden ? 'rgba(120,75,10,0.35)' : 'rgba(70,40,15,0.32)';
+  ctx.stroke();
+
+  // 左上高光
+  var hg = ctx.createRadialGradient(-this.R * 0.32, -this.R * 0.38, this.R * 0.05, -this.R * 0.32, -this.R * 0.38, this.R * 0.95);
+  hg.addColorStop(0, 'rgba(255,248,220,0.24)');
+  hg.addColorStop(1, 'rgba(255,248,220,0)');
+  ctx.fillStyle = hg;
+  ctx.fillRect(-SS, -SS, SS * 2, SS * 2);
+
+  ctx.restore();
+};
+
+Potato.prototype.buildFleshBlobs = function () {
+  this.blobs = [];
+  for (var i = 0; i < 26; i++) {
+    var a = this.rand() * Math.PI * 2;
+    var d = Math.sqrt(this.rand()) * 0.9;
+    this.blobs.push({
+      x: Math.cos(a) * this.R * this.xScale * d,
+      y: Math.sin(a) * this.R * this.yScale * d,
+      rx: this.R * (0.05 + this.rand() * 0.1),
+      ry: this.R * (0.04 + this.rand() * 0.08),
+      a: 0.04 + this.rand() * 0.08,
+      rot: this.rand() * Math.PI
+    });
+  }
+};
+
+Potato.prototype.beginStroke = function (x, y) {
+  this.lastX = x;
+  this.lastY = y;
+};
+
+Potato.prototype.endStroke = function () {
+  this.lastX = null;
+  this.lastY = null;
+};
+
+Potato.prototype.peelTo = function (x, y) {
+  if (this.lastX === null) {
+    this.lastX = x;
+    this.lastY = y;
+    return { removed: 0, wasteAdded: 0 };
+  }
+  var x1 = this.lastX;
+  var y1 = this.lastY;
+  var dx = x - x1;
+  var dy = y - y1;
+  var dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist < 0.4) return { removed: 0, wasteAdded: 0 };
+
+  this.eraseTrail(x1, y1, x, y);
+
+  var step = CONFIG.play.stampStep;
+  var steps = Math.max(1, Math.ceil(dist / step));
+  var beforePeel = this.peeledCells;
+  var beforeWaste = this.wasteCells;
+  var moving = dist > 1.2;
+  for (var i = 1; i <= steps; i++) {
+    var t = i / steps;
+    this.stamp(x1 + dx * t, y1 + dy * t, this.brush, moving);
+  }
+  this.lastX = x;
+  this.lastY = y;
+
+  if (this.peeledCells / this.skinTotal >= this.target) this.completed = true;
+
+  return {
+    removed: this.peeledCells - beforePeel,
+    wasteAdded: this.wasteCells - beforeWaste
+  };
+};
+
+Potato.prototype.stamp = function (x, y, r, moving) {
+  var gw = this.gw;
+  var cw = this.cw;
+  var ch = this.ch;
+  var gx0 = Math.max(0, Math.floor((x - r - this.bx0) / cw));
+  var gx1 = Math.min(gw - 1, Math.floor((x + r - this.bx0) / cw));
+  var gy0 = Math.max(0, Math.floor((y - r - this.by0) / ch));
+  var gy1 = Math.min(this.gh - 1, Math.floor((y + r - this.by0) / ch));
+  var r2 = r * r;
+  for (var gy = gy0; gy <= gy1; gy++) {
+    var py = this.by0 + (gy + 0.5) * ch;
+    var row = gy * gw;
+    for (var gx = gx0; gx <= gx1; gx++) {
+      var idx = row + gx;
+      if (!this.inside[idx]) continue;
+      var px = this.bx0 + (gx + 0.5) * cw;
+      var ddx = px - x;
+      var ddy = py - y;
+      if (ddx * ddx + ddy * ddy > r2) continue;
+      if (this.state[idx] === 1) {
+        this.state[idx] = 2;
+        this.peeledCells++;
+      } else if (moving && this.depth[idx] < this.wasteThreshold) {
+        this.depth[idx]++;
+        if (this.depth[idx] === this.wasteThreshold) this.wasteCells++;
+      }
+    }
+  }
+};
+
+Potato.prototype.eraseTrail = function (x1, y1, x2, y2) {
+  if (!this.skin) return;
+  var ctx = this.skin.getContext('2d');
+  ctx.save();
+  if (ctx.setTransform) ctx.setTransform(this.dpr, 0, 0, this.dpr, this.skinSize / 2, this.skinSize / 2);
+  else { ctx.translate(this.skinSize / 2, this.skinSize / 2); ctx.scale(this.dpr, this.dpr); }
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = 'rgba(0,0,0,1)';
+  ctx.lineWidth = this.brush * 1.9;
+  ctx.beginPath();
+  ctx.moveTo(x1 - this.cx, y1 - this.cy);
+  ctx.lineTo(x2 - this.cx, y2 - this.cy);
+  ctx.stroke();
+
+  // 轻微毛边，让削痕更像刀口
+  ctx.lineWidth = this.brush * 0.38;
+  for (var i = 0; i < 3; i++) {
+    var ox = (this.rand() - 0.5) * this.brush * 1.5;
+    var oy = (this.rand() - 0.5) * this.brush * 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x1 - this.cx + ox, y1 - this.cy + oy);
+    ctx.lineTo(x2 - this.cx + ox, y2 - this.cy + oy);
+    ctx.stroke();
+  }
+  ctx.restore();
+};
+
+Potato.prototype.progress = function () {
+  return Math.min(1, this.peeledCells / Math.max(1, this.skinTotal));
+};
+
+Potato.prototype.waste = function () {
+  return Math.min(1, this.wasteCells / Math.max(1, this.insideTotal));
+};
+
+Potato.prototype.render = function (ctx, t) {
+  var cx = this.cx;
+  var cy = this.cy;
+  var R = this.R;
+  var intro = this.introT;
+  var scale = intro < 1 ? 0.82 + 0.18 * intro : 1;
+  var alpha = Math.min(1, intro * 1.6) * (1 - this.goneT);
+
+  ctx.save();
+  ctx.translate(cx, cy - (1 - intro) * 40);
+  ctx.scale(scale, scale);
+  ctx.translate(-cx, -cy);
+  ctx.globalAlpha = alpha;
+
+  // 接触阴影
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse ? ctx.ellipse(cx, cy + R * 0.92, R * 0.72, R * 0.14, 0, 0, Math.PI * 2) :
+    ctx.arc(cx, cy + R * 0.92, R * 0.3, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(70,40,15,0.2)';
+  ctx.fill();
+  ctx.restore();
+
+  // 果肉外投影，避免削净后与奶油色背景糊在一起
+  ctx.save();
+  ctx.shadowColor = 'rgba(80,45,18,0.3)';
+  ctx.shadowBlur = 18;
+  ctx.shadowOffsetY = 7;
+  this.shapePath(ctx, 1, cx, cy);
+  ctx.fillStyle = '#E6C58B';
+  ctx.fill();
+  ctx.restore();
+
+  // 果肉
+  ctx.save();
+  this.shapePath(ctx, 1, cx, cy);
+  ctx.clip();
+  var g = ctx.createRadialGradient(cx - R * 0.3, cy - R * 0.35, R * 0.1, cx, cy, R * 1.3);
+  g.addColorStop(0, '#FFF5D6');
+  g.addColorStop(0.55, '#F6E2AC');
+  g.addColorStop(1, '#DFBC77');
+  ctx.fillStyle = g;
+  ctx.fillRect(cx - R * 1.4, cy - R * 1.4, R * 2.8, R * 2.8);
+
+  for (var i = 0; i < this.blobs.length; i++) {
+    var b = this.blobs[i];
+    ctx.save();
+    ctx.translate(cx + b.x, cy + b.y);
+    ctx.rotate(b.rot);
+    ctx.scale(b.rx, b.ry);
+    ctx.beginPath();
+    ctx.arc(0, 0, 1, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(210,166,98,' + b.a + ')';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  this.shapePath(ctx, 0.995, cx, cy);
+  ctx.lineWidth = R * 0.2;
+  ctx.strokeStyle = 'rgba(150,104,45,0.22)';
+  ctx.stroke();
+  ctx.restore();
+
+  // 皮肤图层
+  if (this.skin) {
+    ctx.drawImage(this.skin, cx - this.SS / 2, cy - this.SS / 2, this.SS, this.SS);
+  }
+
+  // 轮廓
+  this.shapePath(ctx, 1.012, cx, cy);
+  ctx.lineWidth = 2.2;
+  ctx.strokeStyle = this.golden ? 'rgba(120,78,15,0.62)' : 'rgba(90,52,20,0.5)';
+  ctx.stroke();
+
+  // 小芽
+  if (this.goneT < 0.5) {
+    var sx = cx + R * 0.18;
+    var sy = cy - R * 0.92;
+    ctx.save();
+    ctx.strokeStyle = '#5E8B45';
+    ctx.lineWidth = Math.max(2, R * 0.025);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(sx, sy + R * 0.12);
+    ctx.quadraticCurveTo(sx + R * 0.02, sy - R * 0.04, sx + R * 0.12, sy - R * 0.12);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse ? ctx.ellipse(sx + R * 0.15, sy - R * 0.15, R * 0.1, R * 0.055, -0.5, 0, Math.PI * 2) :
+      ctx.arc(sx + R * 0.12, sy - R * 0.12, R * 0.08, 0, Math.PI * 2);
+    ctx.fillStyle = '#7FB069';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // 金土豆闪光
+  if (this.golden) {
+    var tw = 0.6 + 0.4 * Math.sin(t * 3 + this.seed);
+    for (var k = 0; k < 4; k++) {
+      var a2 = t * 0.8 + k * Math.PI / 2 + this.seed;
+      var px2 = cx + Math.cos(a2) * R * 0.62;
+      var py2 = cy + Math.sin(a2) * R * 0.2 - R * 0.3;
+      drawSpark(ctx, px2, py2, R * 0.045 * (0.6 + tw), 'rgba(255,245,180,' + (0.4 + tw * 0.4) + ')');
+    }
+  }
+
+  // 完成光晕
+  if (this.progress() >= this.target && this.goneT < 0.2) {
+    var pulse = 0.5 + 0.5 * Math.sin(t * 5);
+    ctx.save();
+    this.shapePath(ctx, 1.035 + pulse * 0.02, cx, cy);
+    ctx.lineWidth = 4 + pulse * 3;
+    ctx.strokeStyle = 'rgba(255,214,110,' + (0.35 + pulse * 0.35) + ')';
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  ctx.restore();
+};
+
+function drawSpark(ctx, x, y, r, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.beginPath();
+  ctx.moveTo(0, -r);
+  ctx.quadraticCurveTo(r * 0.18, -r * 0.18, r, 0);
+  ctx.quadraticCurveTo(r * 0.18, r * 0.18, 0, r);
+  ctx.quadraticCurveTo(-r * 0.18, r * 0.18, -r, 0);
+  ctx.quadraticCurveTo(-r * 0.18, -r * 0.18, 0, -r);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.restore();
+}
+
+Potato.prototype.dispose = function () {
+  if (this.skin) {
+    this.skin.width = 1;
+    this.skin.height = 1;
+    this.skin = null;
+  }
+};
+
+module.exports = Potato;
+
+};
+__defs["fx"] = function(module, exports, require){
+/**
+ * 削皮碎屑、星光与飘字。
+ */
+function FX() {
+  this.parts = [];
+  this.texts = [];
+}
+
+FX.prototype.peelBurst = function (x, y, dx, dy, count, golden) {
+  var len = Math.sqrt(dx * dx + dy * dy) || 1;
+  var nx = -dy / len;
+  var ny = dx / len;
+  var palette = golden ? ['#F2C85B', '#E2AC3F', '#FFF0B8'] : ['#B0743E', '#C98F5B', '#8A5326'];
+  for (var i = 0; i < count; i++) {
+    var side = Math.random() > 0.5 ? 1 : -1;
+    var sp = 40 + Math.random() * 110;
+    this.parts.push({
+      type: 'curl',
+      x: x + (Math.random() - 0.5) * 18,
+      y: y + (Math.random() - 0.5) * 18,
+      vx: nx * sp * side + (Math.random() - 0.5) * 30,
+      vy: ny * sp * side - 40 - Math.random() * 60,
+      g: 520,
+      rot: Math.random() * 6.28,
+      vr: (Math.random() - 0.5) * 9,
+      size: 4 + Math.random() * 6,
+      color: palette[Math.floor(Math.random() * palette.length)],
+      life: 0.5 + Math.random() * 0.5,
+      ttl: 1
+    });
+  }
+  if (this.parts.length > 180) this.parts.splice(0, this.parts.length - 180);
+};
+
+FX.prototype.sparkle = function (x, y, count, color, spread) {
+  spread = spread || 40;
+  for (var i = 0; i < count; i++) {
+    var a = Math.random() * Math.PI * 2;
+    var sp = 30 + Math.random() * 130;
+    this.parts.push({
+      type: 'spark',
+      x: x,
+      y: y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp - 40,
+      g: 260,
+      rot: Math.random() * 6.28,
+      vr: (Math.random() - 0.5) * 6,
+      size: 3 + Math.random() * 5,
+      color: color || '#F2B84B',
+      life: 0.45 + Math.random() * 0.6,
+      ttl: 1
+    });
+  }
+};
+
+FX.prototype.floatText = function (x, y, str, color, size) {
+  this.texts.push({
+    x: x,
+    y: y,
+    str: str,
+    color: color || '#4A2E19',
+    size: size || 22,
+    life: 1.0,
+    ttl: 1.0
+  });
+};
+
+FX.prototype.update = function (dt) {
+  var i;
+  for (i = this.parts.length - 1; i >= 0; i--) {
+    var p = this.parts[i];
+    p.life -= dt;
+    if (p.life <= 0) { this.parts.splice(i, 1); continue; }
+    p.vy += p.g * dt;
+    p.vx *= 0.985;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.rot += p.vr * dt;
+  }
+  for (i = this.texts.length - 1; i >= 0; i--) {
+    var t = this.texts[i];
+    t.life -= dt;
+    if (t.life <= 0) { this.texts.splice(i, 1); continue; }
+    t.y -= 42 * dt;
+  }
+};
+
+FX.prototype.render = function (ctx) {
+  for (var i = 0; i < this.parts.length; i++) {
+    var p = this.parts[i];
+    var a = Math.max(0, Math.min(1, p.life / p.ttl));
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    if (p.type === 'spark') {
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      var r = p.size;
+      ctx.moveTo(0, -r);
+      ctx.quadraticCurveTo(r * 0.2, -r * 0.2, r, 0);
+      ctx.quadraticCurveTo(r * 0.2, r * 0.2, 0, r);
+      ctx.quadraticCurveTo(-r * 0.2, r * 0.2, -r, 0);
+      ctx.quadraticCurveTo(-r * 0.2, -r * 0.2, 0, -r);
+      ctx.fill();
+    } else {
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = Math.max(1.5, p.size * 0.34);
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.arc(0, 0, p.size, 0.4, 2.5);
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,245,215,0.45)';
+      ctx.lineWidth = Math.max(1, p.size * 0.14);
+      ctx.beginPath();
+      ctx.arc(0, 0, p.size, 0.55, 2.2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  for (var j = 0; j < this.texts.length; j++) {
+    var t = this.texts[j];
+    var al = Math.max(0, Math.min(1, t.life / t.ttl));
+    ctx.save();
+    ctx.globalAlpha = al;
+    ctx.font = '800 ' + t.size + 'px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = 'rgba(255,248,230,0.9)';
+    ctx.strokeText(t.str, t.x, t.y);
+    ctx.fillStyle = t.color;
+    ctx.fillText(t.str, t.x, t.y);
+    ctx.restore();
+  }
+};
+
+FX.prototype.clear = function () {
+  this.parts.length = 0;
+  this.texts.length = 0;
+};
+
+module.exports = FX;
+
+};
+__defs["spike3d"] = function(module, exports, require){
+/**
+ * Task 1 技术验证（Spike）：
+ * 验证在微信小游戏中「主画布 WebGL(Three.js) + 离屏 2D 画布作 UI 纹理合成 + 射线取 UV」可行。
+ * 同时兼容浏览器（index.html?spike=1），用同一套代码验证预打包的 three 能正常运行。
+ * 验证通过后此文件会被正式的 render3d.js 替代。
+ */
+var loader = require('./three-loader');
+var loadTHREE = loader.loadTHREE;
+var isWx = loader.isWx;
+
+function makeCanvas(w, h) {
+  var c = isWx ? wx.createCanvas() : document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  return c;
+}
+
+function run() {
+  var info = isWx
+    ? wx.getSystemInfoSync()
+    : { windowWidth: window.innerWidth, windowHeight: window.innerHeight, pixelRatio: window.devicePixelRatio || 1 };
+  var W = info.windowWidth;
+  var H = info.windowHeight;
+  var dpr = info.pixelRatio || 1;
+
+  var glCanvas, uiCanvas, uictx;
+  if (isWx) {
+    glCanvas = wx.createCanvas();  // 第一个 = 上屏 WebGL 画布
+    uiCanvas = wx.createCanvas();  // 第二个 = 离屏 2D 画布（UI 层）
+  } else {
+    glCanvas = document.createElement('canvas');
+    glCanvas.style.cssText = 'position:fixed;left:0;top:0;width:100vw;height:100vh;display:block;touch-action:none;';
+    document.body.appendChild(glCanvas);
+    uiCanvas = document.createElement('canvas');
+  }
+  glCanvas.width = W;
+  glCanvas.height = H;
+  uiCanvas.width = W;
+  uiCanvas.height = H;
+  uictx = uiCanvas.getContext('2d');
+
+  var THREE, renderer, scene, camera, cube, uiScene, uiCam, uiQuad, uiTexture, raycaster, pointer, lastUV;
+
+  try {
+    THREE = loadTHREE(glCanvas);
+
+    var gl = glCanvas.getContext('webgl') || glCanvas.getContext('experimental-webgl');
+    if (!gl) throw new Error('WebGL context unavailable');
+
+    renderer = new THREE.WebGLRenderer({ canvas: glCanvas, context: gl, antialias: true });
+    renderer.setPixelRatio(dpr);
+    renderer.setSize(W, H, false);
+
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x2a1a10);
+    camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 100);
+    camera.position.set(0, 0, 4);
+
+    // 程序生成一张带网格的纹理，方便确认 UV 与旋转
+    var tc = makeCanvas(256, 256);
+    var tx = tc.getContext('2d');
+    tx.fillStyle = '#c89b6b'; tx.fillRect(0, 0, 256, 256);
+    tx.strokeStyle = '#5a3a1c'; tx.lineWidth = 2;
+    for (var i = 0; i <= 256; i += 32) {
+      tx.beginPath(); tx.moveTo(i, 0); tx.lineTo(i, 256); tx.stroke();
+      tx.beginPath(); tx.moveTo(0, i); tx.lineTo(256, i); tx.stroke();
+    }
+    tx.fillStyle = '#fff'; tx.font = 'bold 40px sans-serif'; tx.textAlign = 'center';
+    tx.fillText('UV', 128, 145);
+    var cubeTex = new THREE.CanvasTexture(tc);
+
+    cube = new THREE.Mesh(
+      new THREE.BoxGeometry(2, 2, 2),
+      new THREE.MeshLambertMaterial({ map: cubeTex })
+    );
+    scene.add(cube);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    var dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(3, 4, 5);
+    scene.add(dir);
+
+    // UI 层：离屏 2D 画布 → 全屏纹理 quad 叠加
+    uiTexture = new THREE.CanvasTexture(uiCanvas);
+    uiScene = new THREE.Scene();
+    uiCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, 0, 10);
+    uiQuad = new THREE.Mesh(
+      new THREE.PlaneGeometry(W, H),
+      new THREE.MeshBasicMaterial({ map: uiTexture, transparent: true, depthTest: false, depthWrite: false })
+    );
+    uiQuad.renderOrder = 999;
+    uiScene.add(uiQuad);
+
+    // 射线检测
+    raycaster = new THREE.Raycaster();
+    pointer = new THREE.Vector2();
+    lastUV = null;
+  } catch (e) {
+    console.error('[spike3d] init failed:', e && e.message ? e.message : e);
+    if (typeof wx !== 'undefined' && wx.showToast) {
+      wx.showToast({ title: '3D spike 初始化失败', icon: 'none' });
+    }
+    return;
+  }
+
+  function onMove(x, y) {
+    pointer.x = (x / W) * 2 - 1;
+    pointer.y = -(y / H) * 2 + 1;
+    raycaster.setFromCamera(pointer, camera);
+    var hits = raycaster.intersectObject(cube, false);
+    if (hits.length && hits[0].uv) {
+      var uv = hits[0].uv;
+      lastUV = { x: uv.x, y: uv.y, px: x, py: y };
+    } else {
+      lastUV = null;
+    }
+  }
+
+  if (isWx) {
+    wx.onTouchStart(function (e) { if (e.touches && e.touches[0]) onMove(e.touches[0].clientX, e.touches[0].clientY); });
+    wx.onTouchMove(function (e) { if (e.touches && e.touches[0]) onMove(e.touches[0].clientX, e.touches[0].clientY); });
+  } else {
+    glCanvas.addEventListener('mousemove', function (e) { onMove(e.clientX, e.clientY); });
+    glCanvas.addEventListener('touchmove', function (e) { if (e.touches && e.touches[0]) onMove(e.touches[0].clientX, e.touches[0].clientY); }, { passive: true });
+  }
+
+  function drawUI() {
+    uictx.clearRect(0, 0, W, H);
+    uictx.fillStyle = 'rgba(20,12,6,0.6)';
+    uictx.fillRect(0, 0, W, 70);
+    uictx.fillStyle = '#f7e3ae';
+    uictx.font = 'bold 22px sans-serif';
+    uictx.textAlign = 'left';
+    uictx.fillText(isWx ? '3D SPIKE: WebGL立方体 + 离屏UI合成' : '3D SPIKE (browser): WebGL + UI composite', 16, 44);
+    if (lastUV) {
+      uictx.fillStyle = 'rgba(40,80,40,0.75)';
+      uictx.fillRect(W - 250, H - 78, 240, 68);
+      uictx.fillStyle = '#aef7b0';
+      uictx.font = '14px monospace';
+      uictx.textAlign = 'left';
+      uictx.fillText('HIT UV = (' + lastUV.x.toFixed(3) + ', ' + lastUV.y.toFixed(3) + ')', W - 240, H - 50);
+      uictx.fillText('pointer = (' + lastUV.px.toFixed(0) + ', ' + lastUV.py.toFixed(0) + ')', W - 240, H - 30);
+    }
+    uiTexture.needsUpdate = true;
+  }
+
+  var t0 = Date.now();
+  var raf = (typeof requestAnimationFrame !== 'undefined') ? requestAnimationFrame : (isWx ? null : window.requestAnimationFrame);
+  function loop() {
+    var t = (Date.now() - t0) / 1000;
+    cube.rotation.x = t * 0.5;
+    cube.rotation.y = t * 0.7;
+    drawUI();
+    renderer.autoClear = true;
+    renderer.render(scene, camera);
+    renderer.autoClear = false;
+    renderer.clearDepth();
+    renderer.render(uiScene, uiCam);
+    if (raf) raf(loop);
+  }
+  loop();
+
+  console.log('[spike3d] running, env=' + (isWx ? 'wechat' : 'browser'));
+}
+
+module.exports = { run: run };
 
 };
 __load("main");

@@ -162,10 +162,10 @@ var CONFIG = {
   },
 
   // 3D 渲染（Three.js）配置。
-  // Task 1 验证期：spike 在微信环境默认开启（开发者工具编译即可看到验证画面）；
-  // 浏览器需在 URL 加 ?spike=1 才进入 spike，否则跑正常游戏。验证通过后 spike 关闭。
+  // Task 1 技术验证已完成，spike 默认关闭。
+  // 如需重新跑 3D 验证，把 spike 改为 true。
   render3d: {
-    spike: (typeof wx !== 'undefined') ? true : (typeof window !== 'undefined' && /[?&]spike=1/.test(window.location.search))
+    spike: false
   }
 };
 

@@ -10,6 +10,7 @@ var UI = require('../ui');
 var T = UI.T;
 var Potato = require('../potato');
 var FX = require('../fx');
+var render3d = require('../render3d');
 
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function fmtTime(s) {
@@ -26,6 +27,7 @@ function easeOutBack(x) {
 
 function PlayScene(main) {
   this.main = main;
+  this._3d = !!main._3dOk;
   this.order = Economy.nextOrder();
   this.effects = Economy.effects();
   this.results = [];
@@ -52,6 +54,7 @@ function PlayScene(main) {
   this.lastPoint = null;
   this.tutorial = !Economy.s.tutorialDone;
   this.state = this.tutorial ? 'tutorial' : 'play';
+  this._tool = 'knife'; // 当前选中工具
   this.layout();
   this.spawnPotato(0);
   this.state = this.tutorial ? 'tutorial' : 'play';
@@ -59,11 +62,17 @@ function PlayScene(main) {
 
 PlayScene.prototype.enter = function () {
   Ads.hideBanner();
+  if (this._3d) {
+    render3d.setPotatoVisible(true);
+    render3d.setClearColor(0x2a1a10, 1); // 深色背景，让 3D 土豆突出
+    render3d.setTool(this._tool);
+  }
 };
 
 PlayScene.prototype.onHide = function () {
   if (this.state === 'play') this.openPause();
   Economy.save();
+  if (this._3d) render3d.setPotatoVisible(false);
 };
 
 PlayScene.prototype.layout = function () {
@@ -117,6 +126,18 @@ PlayScene.prototype.layout = function () {
   var th = 336;
   this.tutorialCard = { x: (W - tw) / 2, y: (H - th) / 2, w: tw, h: th };
   this.tutorialBtn = { x: this.tutorialCard.x + 24, y: this.tutorialCard.y + th - 70, w: tw - 48, h: 46, action: 'tutorialStart', pressed: false };
+
+  // 工具选择栏（3D 模式专用）
+  var toolY = Math.min(H - sb - 16, this.boardY + this.R * 0.34 + 100);
+  var btnSq = 52;
+  var gap = 12;
+  var totalW = btnSq * 3 + gap * 2;
+  var startX = (W - totalW) / 2;
+  this.toolBtns = [
+    { id: 'knife',  label: '削皮刀', x: startX, y: toolY, w: btnSq, h: btnSq, pressed: false },
+    { id: 'fork',   label: '叉子',  x: startX + btnSq + gap, y: toolY, w: btnSq, h: btnSq, pressed: false },
+    { id: 'grater', label: '刨丝器', x: startX + (btnSq + gap) * 2, y: toolY, w: btnSq, h: btnSq, pressed: false }
+  ];
 };
 
 PlayScene.prototype.spawnPotato = function (i) {
@@ -141,6 +162,11 @@ PlayScene.prototype.spawnPotato = function (i) {
   this.serveT = 0;
   this.dragging = false;
   this.lastPoint = null;
+
+  if (this._3d) {
+    render3d.resetSkin(golden);
+    render3d.positionPotato(this.cx, this.cy, this.potato.R);
+  }
 };
 
 PlayScene.prototype.onDown = function (p) {
@@ -174,6 +200,19 @@ PlayScene.prototype.onDown = function (p) {
   }
   if (st !== 'play') return;
 
+  // 3D 工具按钮
+  if (this._3d) {
+    for (var ti = 0; ti < this.toolBtns.length; ti++) {
+      var tb = this.toolBtns[ti];
+      if (UI.hit(tb, p.x, p.y)) {
+        this._tool = tb.id;
+        render3d.setTool(this._tool);
+        Sound.tap();
+        return;
+      }
+    }
+  }
+
   if (UI.hit(this.pauseBtn, p.x, p.y)) { this.pressedAction = 'pause'; Sound.tap(); return; }
   if (this.canComplete() && UI.hit(this.completeBtn, p.x, p.y)) {
     this.pressedAction = 'complete';
@@ -196,6 +235,9 @@ PlayScene.prototype.onMove = function (p) {
   var dx = p.x - this.lastPoint.x;
   var dy = p.y - this.lastPoint.y;
   var res = this.potato.peelTo(p.x, p.y);
+  if (this._3d) {
+    render3d.peelTrail(this.lastPoint.x, this.lastPoint.y, p.x, p.y, this.effects.brush || 14);
+  }
   if (res.removed > 0) {
     Sound.peel();
     if (this.peelHapticT <= 0) {
@@ -409,14 +451,30 @@ PlayScene.prototype.update = function (dt) {
 };
 
 PlayScene.prototype.render = function (ctx) {
-  this.drawBackground(ctx);
-  this.drawBoard(ctx);
-  if (this.potato) this.potato.render(ctx, this.t);
+  // 3D 模式：跳过 drawBackground / drawBoard（让 3D 层背景透出来），
+  // UI canvas 默认透明，只有 HUD/按钮/FX 是不透明的 → 直接看见 3D 土豆
+  if (this._3d) {
+    ctx.clearRect(0, 0, this.W, this.H);
+    // 轻微的顶光装饰（不遮挡 3D 主体）
+    var lg = ctx.createRadialGradient(this.cx, this.safeTop + 20, 4, this.cx, this.cy, this.R * 2);
+    lg.addColorStop(0, 'rgba(255,248,220,0.18)');
+    lg.addColorStop(1, 'rgba(255,248,220,0)');
+    ctx.fillStyle = lg;
+    ctx.fillRect(0, 0, this.W, this.H);
+  } else {
+    this.drawBackground(ctx);
+    this.drawBoard(ctx);
+    if (this.potato) this.potato.render(ctx, this.t);
+  }
+
   this.fx.render(ctx);
   this.drawHUD(ctx);
   this.drawProgress(ctx);
   this.drawHint(ctx);
   this.drawCompleteButton(ctx);
+
+  // 工具选择 UI（3D 模式才显示）
+  if (this._3d) this.drawToolBar(ctx);
 
   if (this.state === 'tutorial') this.drawTutorial(ctx);
   else if (this.state === 'paused') this.drawPause(ctx);
@@ -660,6 +718,79 @@ PlayScene.prototype.drawCompleteButton = function (ctx) {
   ctx.translate(-(b.x + b.w / 2), -(b.y + b.h / 2));
   UI.button(ctx, b);
   ctx.restore();
+};
+
+PlayScene.prototype.drawToolBar = function (ctx) {
+  var tools = this.toolBtns;
+  for (var i = 0; i < tools.length; i++) {
+    var b = tools[i];
+    var selected = this._tool === b.id;
+    var cx = b.x + b.w / 2;
+    var cy = b.y + b.h / 2;
+
+    // 背景胶囊
+    ctx.save();
+    ctx.shadowColor = selected ? 'rgba(244,220,180,0.5)' : 'rgba(0,0,0,0.3)';
+    ctx.shadowBlur = selected ? 14 : 8;
+    ctx.shadowOffsetY = 2;
+    UI.fillRR(ctx, b.x, b.y, b.w, b.h, 14, selected ? '#FFE6B0' : '#3D2A1C');
+    ctx.restore();
+
+    // 选中描边
+    if (selected) {
+      ctx.strokeStyle = '#FF9A3C';
+      ctx.lineWidth = 2.5;
+      UI.strokeRR(ctx, b.x, b.y, b.w, b.h, 14);
+    }
+
+    // 图标
+    ctx.fillStyle = selected ? '#8B4513' : '#FFE6B0';
+    if (b.id === 'knife') {
+      // 削皮刀：一把小刀（三角形+刀柄）
+      ctx.save();
+      ctx.translate(cx - 6, cy + 8);
+      ctx.rotate(-0.5);
+      ctx.beginPath();
+      ctx.moveTo(0, 0); ctx.lineTo(20, -6); ctx.lineTo(20, 0); ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      ctx.fillRect(cx + 8, cy + 4, 10, 4);
+    } else if (b.id === 'fork') {
+      // 叉子
+      ctx.save();
+      ctx.translate(cx, cy - 8);
+      ctx.strokeStyle = selected ? '#8B4513' : '#FFE6B0';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(-10, 0); ctx.lineTo(-10, 18); ctx.moveTo(-3, 0); ctx.lineTo(-3, 18); ctx.moveTo(4, 0); ctx.lineTo(4, 18); ctx.moveTo(11, 0); ctx.lineTo(11, 18); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-14, 18); ctx.lineTo(14, 18); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, 18); ctx.lineTo(0, 30); ctx.stroke();
+      ctx.restore();
+    } else if (b.id === 'grater') {
+      // 刨丝器（波浪 + 底部细丝）
+      ctx.beginPath();
+      ctx.moveTo(cx - 16, cy + 12);
+      for (var g = 0; g < 6; g++) {
+        ctx.lineTo(cx - 16 + g * 5.3, cy + 12 + Math.sin(g * 1.2) * -10);
+      }
+      ctx.lineTo(cx + 16, cy + 12);
+      ctx.strokeStyle = selected ? '#8B4513' : '#FFE6B0';
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+      ctx.beginPath();
+      for (var f = 0; f < 5; f++) {
+        var fx2 = cx - 14 + f * 7;
+        ctx.moveTo(fx2, cy + 12);
+        ctx.lineTo(fx2 + 1, cy + 20);
+      }
+      ctx.stroke();
+    }
+
+    // 标签
+    ctx.fillStyle = selected ? '#5C2C0C' : '#DDBE8B';
+    ctx.font = 'bold 10px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(b.label, cx, b.y + b.h + 14);
+  }
 };
 
 PlayScene.prototype.drawTutorial = function (ctx) {

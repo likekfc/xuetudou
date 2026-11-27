@@ -14,7 +14,9 @@ var Platform = {
   safeBottom: 0,
   _touches: null,
 
-  init: function (touchHandlers) {
+  // opts: { canvas: 外部传入的 canvas（3D 模式下是离屏 uiCanvas）, touchCanvas: 浏览器模式下接收 pointer 事件的可见 canvas }
+  init: function (touchHandlers, opts) {
+    opts = opts || {};
     var info = this._windowInfo();
     this.dpr = Math.min(info.pixelRatio || 1, 2.5);
     this.W = info.windowWidth;
@@ -22,8 +24,13 @@ var Platform = {
     this.safeTop = info.safeTop || 0;
     this.safeBottom = info.safeBottom || 0;
 
-    if (isWx) {
+    if (opts.canvas) {
+      // 3D 模式：外部传入离屏 canvas 当 UI 绘制目标
+      this.canvas = opts.canvas;
+      this.touchCanvas = opts.touchCanvas || opts.canvas;
+    } else if (isWx) {
       this.canvas = wx.createCanvas();
+      this.touchCanvas = this.canvas;
     } else {
       this.canvas = document.getElementById('game');
       if (!this.canvas) {
@@ -31,12 +38,16 @@ var Platform = {
         this.canvas.id = 'game';
         document.body.appendChild(this.canvas);
       }
+      this.touchCanvas = this.canvas;
       this.W = Math.round(this.canvas.getBoundingClientRect().width) || info.windowWidth;
       this.H = Math.round(this.canvas.getBoundingClientRect().height) || info.windowHeight;
     }
 
-    this.canvas.width = Math.floor(this.W * this.dpr);
-    this.canvas.height = Math.floor(this.H * this.dpr);
+    // 外部传入 canvas（3D 模式）：尊重 render3d 已经设好的物理尺寸
+    if (!opts.canvas) {
+      this.canvas.width = Math.floor(this.W * this.dpr);
+      this.canvas.height = Math.floor(this.H * this.dpr);
+    }
     this.ctx = this.canvas.getContext('2d');
 
     this._bindTouch(touchHandlers || {});
@@ -81,10 +92,13 @@ var Platform = {
     if (isWx) {
       this.W = info.windowWidth;
       this.H = info.windowHeight;
-    } else {
-      var r = this.canvas.getBoundingClientRect();
+    } else if (this.touchCanvas && this.touchCanvas.getBoundingClientRect) {
+      var r = this.touchCanvas.getBoundingClientRect();
       this.W = Math.round(r.width) || info.windowWidth;
       this.H = Math.round(r.height) || info.windowHeight;
+    } else {
+      this.W = info.windowWidth;
+      this.H = info.windowHeight;
     }
     this.safeTop = info.safeTop;
     this.safeBottom = info.safeBottom;
@@ -134,21 +148,21 @@ var Platform = {
     } else {
       var dragging = false;
       var toLocal = function (ev) {
-        var r = self.canvas.getBoundingClientRect();
+        var r = self.touchCanvas.getBoundingClientRect();
         return {
           x: (ev.clientX - r.left) * (self.W / r.width),
           y: (ev.clientY - r.top) * (self.H / r.height)
         };
       };
-      this.canvas.addEventListener('pointerdown', function (ev) {
+      this.touchCanvas.addEventListener('pointerdown', function (ev) {
         ev.preventDefault();
         dragging = true;
-        if (self.canvas.setPointerCapture) {
-          try { self.canvas.setPointerCapture(ev.pointerId); } catch (e) {}
+        if (self.touchCanvas.setPointerCapture) {
+          try { self.touchCanvas.setPointerCapture(ev.pointerId); } catch (e) {}
         }
         if (h.start) h.start(toLocal(ev));
       });
-      this.canvas.addEventListener('pointermove', function (ev) {
+      this.touchCanvas.addEventListener('pointermove', function (ev) {
         if (!dragging) return;
         ev.preventDefault();
         if (h.move) h.move(toLocal(ev));
@@ -158,9 +172,9 @@ var Platform = {
         dragging = false;
         if (h.end) h.end(toLocal(ev));
       };
-      this.canvas.addEventListener('pointerup', up);
-      this.canvas.addEventListener('pointercancel', up);
-      this.canvas.addEventListener('contextmenu', function (ev) { ev.preventDefault(); });
+      this.touchCanvas.addEventListener('pointerup', up);
+      this.touchCanvas.addEventListener('pointercancel', up);
+      this.touchCanvas.addEventListener('contextmenu', function (ev) { ev.preventDefault(); });
     }
   },
 

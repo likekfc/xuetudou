@@ -8,6 +8,7 @@ var Sound = require('./audio');
 var Ads = require('./ads');
 var UI = require('./ui');
 var T = UI.T;
+var render3d = require('./render3d');
 var MenuScene = require('./scenes/menu');
 var PlayScene = require('./scenes/play');
 
@@ -34,11 +35,25 @@ var Main = {
     Economy.init();
     Sound.setMuted(!Economy.s.settings.sound);
 
+    // 3D 管线优先初始化（创建 WebGL 上屏画布 + 离屏 2D UI 画布）
+    var _3dOk = false;
+    try {
+      render3d.init();
+      _3dOk = true;
+    } catch (e) {
+      console.error('[Main] render3d init failed, fall back to 2D:', e.message);
+    }
+    this._3dOk = _3dOk;
+
+    // 把离屏 uiCanvas 喂给 Platform，游戏 UI 全部画在离屏 canvas 上，
+    // 再由 render3d 每帧作为全屏纹理叠加在 3D 层上
+    var uiCanvas = _3dOk ? render3d.getUICanvas() : null;
+    var touchCanvas = _3dOk ? render3d.getGlCanvas() : null;
     Platform.init({
       start: function (p) { self.onDown(p); },
       move: function (p) { self.onMove(p); },
       end: function (p) { self.onUp(p); }
-    });
+    }, uiCanvas ? { canvas: uiCanvas, touchCanvas: touchCanvas || uiCanvas } : undefined);
     this.ctx = Platform.ctx;
     this.W = Platform.W;
     this.H = Platform.H;
@@ -100,8 +115,12 @@ var Main = {
     if (!this.lastTs) this.lastTs = now;
     var dt = Math.min(0.05, Math.max(0, (now - this.lastTs) / 1000));
     this.lastTs = now;
+    this._t = (this._t || 0) + dt;
     this.update(dt);
     this.render();
+    if (this._3dOk) {
+      try { render3d.render(this._t, dt); } catch (e) { console.error('[render3d.frame]', e.message); }
+    }
     Platform.raf(function (t) { self.frame(t); });
   },
 
@@ -113,6 +132,7 @@ var Main = {
       if (this.fade >= 1) {
         this.fade = 1;
         if (this.pendingScene) {
+          if (this.scene && this.scene.onHide) this.scene.onHide();
           this.scene = this.pendingScene;
           this.pendingScene = null;
           if (this.scene.enter) this.scene.enter();
